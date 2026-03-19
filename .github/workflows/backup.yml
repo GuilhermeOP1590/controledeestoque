@@ -1,0 +1,34 @@
+name: Sistema de Backup Automático
+
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '0 0 * * *' # Roda todo dia à meia-noite automaticamente
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Dá permissão para o GitHub criar as tags
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Criar Tag de Backup
+        run: |
+          TAG_NAME="backup-$(date +'%Y%m%d-%H%M%S')"
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git tag $TAG_NAME
+          git push origin $TAG_NAME
+
+      - name: Manter apenas os 10 mais recentes
+        run: |
+          # Lista tags que começam com 'backup-', ordena por data e apaga as antigas
+          TAGS_PARA_DELETAR=$(git tag --sort=-creatordate | grep "^backup-" | tail -n +11)
+          for tag in $TAGS_PARA_DELETAR; do
+            git push origin --delete $tag
+          done
