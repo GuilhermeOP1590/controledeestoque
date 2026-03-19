@@ -3,6 +3,7 @@ name: Sistema de Backup (Código + Banco Supabase)
 on:
   push:
     branches: [ main ]
+  workflow_dispatch:        # <--- Note que ela está alinhada com o 'push'
   schedule:
     - cron: '0 0 * * *' # Todo dia à meia-noite
 
