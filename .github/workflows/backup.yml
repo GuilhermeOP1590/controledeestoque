@@ -1,44 +1,67 @@
-name: Sistema de Backup (Código + Banco Supabase)
+name: Backup Supabase para GitHub
 
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:
   schedule:
-    - cron: '0 0 * * *' # Todo dia à meia-noite
+    - cron: '0 14 * * *' # Roda todo dia às 11h (horário de Brasília, UTC-3)
+  workflow_dispatch: # Permite rodar manualmente pelo GitHub
 
 jobs:
   backup:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
-      - name: Checkout do código
+      - name: Checkout do repositório
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Instalar Ferramentas do PostgreSQL
-        run: sudo apt-get install -y postgresql-client
+      - name: Instalar cliente PostgreSQL 17
+        run: |
+          sudo apt-get install -y curl ca-certificates
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          sudo sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
 
-      - name: Exportar Tabelas do Supabase (Dump)
+      - name: Criar pasta de backups
+        run: mkdir -p backups
+
+      - name: Fazer backup do schema (estrutura das tabelas)
+        env:
+          DATABASE_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
-          pg_dump "${{ secrets.SUPABASE_DB_URL }}" > backup_tabelas.sql
-        
-      - name: Criar Tag de Backup
+          TIMESTAMP=$(date +'%Y%m%d-%H%M%S')
+          pg_dump "$DATABASE_URL" \
+            --schema-only \
+            --no-owner \
+            --no-acl \
+            -f "backups/schema_${TIMESTAMP}.sql"
+          echo "Schema exportado: backups/schema_${TIMESTAMP}.sql"
+
+      - name: Fazer backup dos dados (conteúdo das tabelas)
+        env:
+          DATABASE_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
-          TAG_NAME="backup-$(date +'%Y%m%d-%H%M%S')"
+          TIMESTAMP=$(date +'%Y%m%d-%H%M%S')
+          pg_dump "$DATABASE_URL" \
+            --data-only \
+            --no-owner \
+            --no-acl \
+            -f "backups/data_${TIMESTAMP}.sql"
+          echo "Dados exportados: backups/data_${TIMESTAMP}.sql"
+
+      - name: Manter apenas os 10 backups mais recentes de cada tipo
+        run: |
+          ls -t backups/schema_*.sql 2>/dev/null | tail -n +11 | xargs -r rm
+          ls -t backups/data_*.sql 2>/dev/null | tail -n +11 | xargs -r rm
+
+      - name: Commitar backups no repositório
+        run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
-          git add backup_tabelas.sql
-          git commit -m "Backup do banco incluído" || echo "Sem mudanças"
-          git tag $TAG_NAME
-          git push origin main
-          git push origin $TAG_NAME
-
-      - name: Manter apenas os 10 mais recentes
-        run: |
-          TAGS_PARA_DELETAR=$(git tag --sort=-creatordate | grep "^backup-" | tail -n +11)
-          for tag in $TAGS_PARA_DELETAR; do
-            git push origin --delete $tag
-          done
+          git add backups/
+          git diff --staged --quiet || git commit -m "backup: $(date +'%Y-%m-%d %H:%M:%S')"
+          git push
