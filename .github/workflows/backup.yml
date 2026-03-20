@@ -34,7 +34,7 @@ jobs:
           DATABASE_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
           TIMESTAMP=$(date +'%Y%m%d-%H%M%S')
-          pg_dump "$DATABASE_URL" \
+          /usr/lib/postgresql/17/bin/pg_dump "$DATABASE_URL" \
             --schema-only \
             --no-owner \
             --no-acl \
@@ -46,7 +46,7 @@ jobs:
           DATABASE_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
           TIMESTAMP=$(date +'%Y%m%d-%H%M%S')
-          pg_dump "$DATABASE_URL" \
+          /usr/lib/postgresql/17/bin/pg_dump "$DATABASE_URL" \
             --data-only \
             --no-owner \
             --no-acl \
