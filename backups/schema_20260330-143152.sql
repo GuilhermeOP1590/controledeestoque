@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict ODf68ZPRmzvcmmqIcsMZ6nknP8tMUZcZErjC3yLZa3xEQrraJazpfXTpufUUVQP
+\restrict NJ5sCkoS0kkw6TCxijhs2HhMXNbLzQ8RnpPOWCJxrgMaUujHb5AeOJNmBNDmrVZ
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.9 (Ubuntu 17.9-1.pgdg24.04+1)
@@ -3071,6 +3071,43 @@ COMMENT ON COLUMN auth.users.is_sso_user IS 'Auth: Set this column to true when 
 
 
 --
+-- Name: webauthn_challenges; Type: TABLE; Schema: auth; Owner: -
+--
+
+CREATE TABLE auth.webauthn_challenges (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid,
+    challenge_type text NOT NULL,
+    session_data jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    CONSTRAINT webauthn_challenges_challenge_type_check CHECK ((challenge_type = ANY (ARRAY['signup'::text, 'registration'::text, 'authentication'::text])))
+);
+
+
+--
+-- Name: webauthn_credentials; Type: TABLE; Schema: auth; Owner: -
+--
+
+CREATE TABLE auth.webauthn_credentials (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    credential_id bytea NOT NULL,
+    public_key bytea NOT NULL,
+    attestation_type text DEFAULT ''::text NOT NULL,
+    aaguid uuid,
+    sign_count bigint DEFAULT 0 NOT NULL,
+    transports jsonb DEFAULT '[]'::jsonb NOT NULL,
+    backup_eligible boolean DEFAULT false NOT NULL,
+    backed_up boolean DEFAULT false NOT NULL,
+    friendly_name text DEFAULT ''::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_used_at timestamp with time zone
+);
+
+
+--
 -- Name: categorias; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -3391,8 +3428,24 @@ CREATE TABLE public.solicitacoes_compra (
     criticidade text DEFAULT 'NORMAL'::text,
     comprador text,
     observacao text DEFAULT ''::text,
-    nota_fiscal text DEFAULT ''::text
+    nota_fiscal text DEFAULT ''::text,
+    valor_unitario_orcado numeric(14,2),
+    valor_total_orcado numeric(14,2)
 );
+
+
+--
+-- Name: COLUMN solicitacoes_compra.valor_unitario_orcado; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.solicitacoes_compra.valor_unitario_orcado IS 'Valor unitário orçado pelo comprador — obrigatório ao avançar para Aprovação Gerencial';
+
+
+--
+-- Name: COLUMN solicitacoes_compra.valor_total_orcado; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.solicitacoes_compra.valor_total_orcado IS 'Valor total orçado = quantidade × valor_unitario_orcado — calculado automaticamente pelo sistema';
 
 
 --
@@ -3466,7 +3519,17 @@ CREATE TABLE public.solicitacoes_cadastro (
     data_aprovacao timestamp with time zone,
     cod_material_criado text,
     estoque_minimo double precision DEFAULT 0,
-    estoque_maximo double precision DEFAULT 0
+    estoque_maximo double precision DEFAULT 0,
+    impacto_operacional text,
+    necessidade_estoque text,
+    prazo_reposicao text,
+    frequencia_uso text,
+    qtd_minima_sugerida numeric DEFAULT 0,
+    qtd_maxima_sugerida numeric DEFAULT 0,
+    classificacao_sugerida text,
+    motivo_classificacao text,
+    classificacao_aprovador text,
+    justificativa_classificacao text
 );
 
 
@@ -3530,6 +3593,50 @@ CREATE VIEW public.solicitacoes_compra_resumo AS
    FROM ((dados_cabecalho dc
      JOIN status_sc ss ON ((ss.numero = dc.numero)))
      LEFT JOIN compradores_sc cs ON ((cs.numero = dc.numero)));
+
+
+--
+-- Name: solicitacoes_correcao_entrada; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.solicitacoes_correcao_entrada (
+    id integer NOT NULL,
+    numero_documento text NOT NULL,
+    tipo text NOT NULL,
+    motivo text NOT NULL,
+    cod_material text,
+    descricao_material text,
+    quantidade_atual numeric,
+    quantidade_nova numeric,
+    status text DEFAULT 'pendente'::text NOT NULL,
+    solicitado_por text NOT NULL,
+    data_solicitacao timestamp with time zone DEFAULT now(),
+    aprovado_por text,
+    data_aprovacao timestamp with time zone,
+    motivo_rejeicao text,
+    CONSTRAINT solicitacoes_correcao_entrada_status_check CHECK ((status = ANY (ARRAY['pendente'::text, 'aprovado'::text, 'rejeitado'::text]))),
+    CONSTRAINT solicitacoes_correcao_entrada_tipo_check CHECK ((tipo = ANY (ARRAY['cancelamento'::text, 'ajuste_quantidade'::text])))
+);
+
+
+--
+-- Name: solicitacoes_correcao_entrada_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.solicitacoes_correcao_entrada_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: solicitacoes_correcao_entrada_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.solicitacoes_correcao_entrada_id_seq OWNED BY public.solicitacoes_correcao_entrada.id;
 
 
 --
@@ -3878,6 +3985,13 @@ ALTER TABLE ONLY public.log_alteracoes_estoque ALTER COLUMN id SET DEFAULT nextv
 
 
 --
+-- Name: solicitacoes_correcao_entrada id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.solicitacoes_correcao_entrada ALTER COLUMN id SET DEFAULT nextval('public.solicitacoes_correcao_entrada_id_seq'::regclass);
+
+
+--
 -- Name: transferencias_cd id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -4140,6 +4254,22 @@ ALTER TABLE ONLY auth.users
 
 
 --
+-- Name: webauthn_challenges webauthn_challenges_pkey; Type: CONSTRAINT; Schema: auth; Owner: -
+--
+
+ALTER TABLE ONLY auth.webauthn_challenges
+    ADD CONSTRAINT webauthn_challenges_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: webauthn_credentials webauthn_credentials_pkey; Type: CONSTRAINT; Schema: auth; Owner: -
+--
+
+ALTER TABLE ONLY auth.webauthn_credentials
+    ADD CONSTRAINT webauthn_credentials_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: categorias categorias_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -4249,6 +4379,14 @@ ALTER TABLE ONLY public.solicitacoes_cadastro
 
 ALTER TABLE ONLY public.solicitacoes_compra
     ADD CONSTRAINT solicitacoes_compra_pkey PRIMARY KEY (numero, item);
+
+
+--
+-- Name: solicitacoes_correcao_entrada solicitacoes_correcao_entrada_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.solicitacoes_correcao_entrada
+    ADD CONSTRAINT solicitacoes_correcao_entrada_pkey PRIMARY KEY (id);
 
 
 --
@@ -4768,6 +4906,55 @@ CREATE INDEX users_is_anonymous_idx ON auth.users USING btree (is_anonymous);
 
 
 --
+-- Name: webauthn_challenges_expires_at_idx; Type: INDEX; Schema: auth; Owner: -
+--
+
+CREATE INDEX webauthn_challenges_expires_at_idx ON auth.webauthn_challenges USING btree (expires_at);
+
+
+--
+-- Name: webauthn_challenges_user_id_idx; Type: INDEX; Schema: auth; Owner: -
+--
+
+CREATE INDEX webauthn_challenges_user_id_idx ON auth.webauthn_challenges USING btree (user_id);
+
+
+--
+-- Name: webauthn_credentials_credential_id_key; Type: INDEX; Schema: auth; Owner: -
+--
+
+CREATE UNIQUE INDEX webauthn_credentials_credential_id_key ON auth.webauthn_credentials USING btree (credential_id);
+
+
+--
+-- Name: webauthn_credentials_user_id_idx; Type: INDEX; Schema: auth; Owner: -
+--
+
+CREATE INDEX webauthn_credentials_user_id_idx ON auth.webauthn_credentials USING btree (user_id);
+
+
+--
+-- Name: idx_correcao_entrada_documento; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_correcao_entrada_documento ON public.solicitacoes_correcao_entrada USING btree (numero_documento);
+
+
+--
+-- Name: idx_correcao_entrada_solicitante; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_correcao_entrada_solicitante ON public.solicitacoes_correcao_entrada USING btree (solicitado_por);
+
+
+--
+-- Name: idx_correcao_entrada_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_correcao_entrada_status ON public.solicitacoes_correcao_entrada USING btree (status);
+
+
+--
 -- Name: idx_entradas_data; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5113,6 +5300,22 @@ ALTER TABLE ONLY auth.sso_domains
 
 
 --
+-- Name: webauthn_challenges webauthn_challenges_user_id_fkey; Type: FK CONSTRAINT; Schema: auth; Owner: -
+--
+
+ALTER TABLE ONLY auth.webauthn_challenges
+    ADD CONSTRAINT webauthn_challenges_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: webauthn_credentials webauthn_credentials_user_id_fkey; Type: FK CONSTRAINT; Schema: auth; Owner: -
+--
+
+ALTER TABLE ONLY auth.webauthn_credentials
+    ADD CONSTRAINT webauthn_credentials_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE;
+
+
+--
 -- Name: usuario_transacoes usuario_transacoes_transacao_codigo_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -5381,5 +5584,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict ODf68ZPRmzvcmmqIcsMZ6nknP8tMUZcZErjC3yLZa3xEQrraJazpfXTpufUUVQP
+\unrestrict NJ5sCkoS0kkw6TCxijhs2HhMXNbLzQ8RnpPOWCJxrgMaUujHb5AeOJNmBNDmrVZ
 
