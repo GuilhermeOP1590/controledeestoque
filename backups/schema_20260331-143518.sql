@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict emzAHgfd3X7h8QZhAZotzR8YZuO7PsFgaGFEYhIQOX1TfcRy0cBPTzzPIM2pn86
+\restrict jAD2yw5su8gfR2fnZBJTSIdENZEVU5oq8GfsloXjdVs8EDJO41LevbfwtVlJ3bF
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.9 (Ubuntu 17.9-1.pgdg24.04+1)
@@ -3428,8 +3428,24 @@ CREATE TABLE public.solicitacoes_compra (
     criticidade text DEFAULT 'NORMAL'::text,
     comprador text,
     observacao text DEFAULT ''::text,
-    nota_fiscal text DEFAULT ''::text
+    nota_fiscal text DEFAULT ''::text,
+    valor_unitario_orcado numeric(14,2),
+    valor_total_orcado numeric(14,2)
 );
+
+
+--
+-- Name: COLUMN solicitacoes_compra.valor_unitario_orcado; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.solicitacoes_compra.valor_unitario_orcado IS 'Valor unitário orçado pelo comprador — obrigatório ao avançar para Aprovação Gerencial';
+
+
+--
+-- Name: COLUMN solicitacoes_compra.valor_total_orcado; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.solicitacoes_compra.valor_total_orcado IS 'Valor total orçado = quantidade × valor_unitario_orcado — calculado automaticamente pelo sistema';
 
 
 --
@@ -3503,7 +3519,17 @@ CREATE TABLE public.solicitacoes_cadastro (
     data_aprovacao timestamp with time zone,
     cod_material_criado text,
     estoque_minimo double precision DEFAULT 0,
-    estoque_maximo double precision DEFAULT 0
+    estoque_maximo double precision DEFAULT 0,
+    impacto_operacional text,
+    necessidade_estoque text,
+    prazo_reposicao text,
+    frequencia_uso text,
+    qtd_minima_sugerida numeric DEFAULT 0,
+    qtd_maxima_sugerida numeric DEFAULT 0,
+    classificacao_sugerida text,
+    motivo_classificacao text,
+    classificacao_aprovador text,
+    justificativa_classificacao text
 );
 
 
@@ -3567,6 +3593,50 @@ CREATE VIEW public.solicitacoes_compra_resumo AS
    FROM ((dados_cabecalho dc
      JOIN status_sc ss ON ((ss.numero = dc.numero)))
      LEFT JOIN compradores_sc cs ON ((cs.numero = dc.numero)));
+
+
+--
+-- Name: solicitacoes_correcao_entrada; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.solicitacoes_correcao_entrada (
+    id integer NOT NULL,
+    numero_documento text NOT NULL,
+    tipo text NOT NULL,
+    motivo text NOT NULL,
+    cod_material text,
+    descricao_material text,
+    quantidade_atual numeric,
+    quantidade_nova numeric,
+    status text DEFAULT 'pendente'::text NOT NULL,
+    solicitado_por text NOT NULL,
+    data_solicitacao timestamp with time zone DEFAULT now(),
+    aprovado_por text,
+    data_aprovacao timestamp with time zone,
+    motivo_rejeicao text,
+    CONSTRAINT solicitacoes_correcao_entrada_status_check CHECK ((status = ANY (ARRAY['pendente'::text, 'aprovado'::text, 'rejeitado'::text]))),
+    CONSTRAINT solicitacoes_correcao_entrada_tipo_check CHECK ((tipo = ANY (ARRAY['cancelamento'::text, 'ajuste_quantidade'::text])))
+);
+
+
+--
+-- Name: solicitacoes_correcao_entrada_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.solicitacoes_correcao_entrada_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: solicitacoes_correcao_entrada_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.solicitacoes_correcao_entrada_id_seq OWNED BY public.solicitacoes_correcao_entrada.id;
 
 
 --
@@ -3912,6 +3982,13 @@ ALTER TABLE ONLY public.historico_status_compra ALTER COLUMN id SET DEFAULT next
 --
 
 ALTER TABLE ONLY public.log_alteracoes_estoque ALTER COLUMN id SET DEFAULT nextval('public.log_alteracoes_estoque_id_seq'::regclass);
+
+
+--
+-- Name: solicitacoes_correcao_entrada id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.solicitacoes_correcao_entrada ALTER COLUMN id SET DEFAULT nextval('public.solicitacoes_correcao_entrada_id_seq'::regclass);
 
 
 --
@@ -4302,6 +4379,14 @@ ALTER TABLE ONLY public.solicitacoes_cadastro
 
 ALTER TABLE ONLY public.solicitacoes_compra
     ADD CONSTRAINT solicitacoes_compra_pkey PRIMARY KEY (numero, item);
+
+
+--
+-- Name: solicitacoes_correcao_entrada solicitacoes_correcao_entrada_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.solicitacoes_correcao_entrada
+    ADD CONSTRAINT solicitacoes_correcao_entrada_pkey PRIMARY KEY (id);
 
 
 --
@@ -4846,6 +4931,27 @@ CREATE UNIQUE INDEX webauthn_credentials_credential_id_key ON auth.webauthn_cred
 --
 
 CREATE INDEX webauthn_credentials_user_id_idx ON auth.webauthn_credentials USING btree (user_id);
+
+
+--
+-- Name: idx_correcao_entrada_documento; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_correcao_entrada_documento ON public.solicitacoes_correcao_entrada USING btree (numero_documento);
+
+
+--
+-- Name: idx_correcao_entrada_solicitante; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_correcao_entrada_solicitante ON public.solicitacoes_correcao_entrada USING btree (solicitado_por);
+
+
+--
+-- Name: idx_correcao_entrada_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_correcao_entrada_status ON public.solicitacoes_correcao_entrada USING btree (status);
 
 
 --
@@ -5478,5 +5584,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict emzAHgfd3X7h8QZhAZotzR8YZuO7PsFgaGFEYhIQOX1TfcRy0cBPTzzPIM2pn86
+\unrestrict jAD2yw5su8gfR2fnZBJTSIdENZEVU5oq8GfsloXjdVs8EDJO41LevbfwtVlJ3bF
 
