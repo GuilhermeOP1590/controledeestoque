@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict ZSdQ4YqGDpsddOZKS8Y32gHmaYXvteWT1rNgecv361VR0ZitR0zfxi8gi3ot1Rb
+\restrict L6MlVRTJ5cpccndxe1TyHuqdnU93rQTedzJ3tXuDIL2lohEGbVGx6X12zoVveUv
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.9 (Ubuntu 17.9-1.pgdg24.04+1)
@@ -1611,6 +1611,67 @@ CREATE FUNCTION realtime.topic() RETURNS text
     LANGUAGE sql STABLE
     AS $$
 select nullif(current_setting('realtime.topic', true), '')::text;
+$$;
+
+
+--
+-- Name: allow_any_operation(text[]); Type: FUNCTION; Schema: storage; Owner: -
+--
+
+CREATE FUNCTION storage.allow_any_operation(expected_operations text[]) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+  WITH current_operation AS (
+    SELECT storage.operation() AS raw_operation
+  ),
+  normalized AS (
+    SELECT CASE
+      WHEN raw_operation LIKE 'storage.%' THEN substr(raw_operation, 9)
+      ELSE raw_operation
+    END AS current_operation
+    FROM current_operation
+  )
+  SELECT EXISTS (
+    SELECT 1
+    FROM normalized n
+    CROSS JOIN LATERAL unnest(expected_operations) AS expected_operation
+    WHERE expected_operation IS NOT NULL
+      AND expected_operation <> ''
+      AND n.current_operation = CASE
+        WHEN expected_operation LIKE 'storage.%' THEN substr(expected_operation, 9)
+        ELSE expected_operation
+      END
+  );
+$$;
+
+
+--
+-- Name: allow_only_operation(text); Type: FUNCTION; Schema: storage; Owner: -
+--
+
+CREATE FUNCTION storage.allow_only_operation(expected_operation text) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+  WITH current_operation AS (
+    SELECT storage.operation() AS raw_operation
+  ),
+  normalized AS (
+    SELECT
+      CASE
+        WHEN raw_operation LIKE 'storage.%' THEN substr(raw_operation, 9)
+        ELSE raw_operation
+      END AS current_operation,
+      CASE
+        WHEN expected_operation LIKE 'storage.%' THEN substr(expected_operation, 9)
+        ELSE expected_operation
+      END AS requested_operation
+    FROM current_operation
+  )
+  SELECT CASE
+    WHEN requested_operation IS NULL OR requested_operation = '' THEN FALSE
+    ELSE COALESCE(current_operation = requested_operation, FALSE)
+  END
+  FROM normalized;
 $$;
 
 
@@ -3596,6 +3657,50 @@ CREATE VIEW public.solicitacoes_compra_resumo AS
 
 
 --
+-- Name: solicitacoes_correcao_entrada; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.solicitacoes_correcao_entrada (
+    id integer NOT NULL,
+    numero_documento text NOT NULL,
+    tipo text NOT NULL,
+    motivo text NOT NULL,
+    cod_material text,
+    descricao_material text,
+    quantidade_atual numeric,
+    quantidade_nova numeric,
+    status text DEFAULT 'pendente'::text NOT NULL,
+    solicitado_por text NOT NULL,
+    data_solicitacao timestamp with time zone DEFAULT now(),
+    aprovado_por text,
+    data_aprovacao timestamp with time zone,
+    motivo_rejeicao text,
+    CONSTRAINT solicitacoes_correcao_entrada_status_check CHECK ((status = ANY (ARRAY['pendente'::text, 'aprovado'::text, 'rejeitado'::text]))),
+    CONSTRAINT solicitacoes_correcao_entrada_tipo_check CHECK ((tipo = ANY (ARRAY['cancelamento'::text, 'ajuste_quantidade'::text])))
+);
+
+
+--
+-- Name: solicitacoes_correcao_entrada_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.solicitacoes_correcao_entrada_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: solicitacoes_correcao_entrada_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.solicitacoes_correcao_entrada_id_seq OWNED BY public.solicitacoes_correcao_entrada.id;
+
+
+--
 -- Name: tipos_localizacao; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -3866,7 +3971,8 @@ CREATE TABLE storage.s3_multipart_uploads (
     version text NOT NULL,
     owner_id text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    user_metadata jsonb
+    user_metadata jsonb,
+    metadata jsonb
 );
 
 
@@ -3938,6 +4044,13 @@ ALTER TABLE ONLY public.historico_status_compra ALTER COLUMN id SET DEFAULT next
 --
 
 ALTER TABLE ONLY public.log_alteracoes_estoque ALTER COLUMN id SET DEFAULT nextval('public.log_alteracoes_estoque_id_seq'::regclass);
+
+
+--
+-- Name: solicitacoes_correcao_entrada id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.solicitacoes_correcao_entrada ALTER COLUMN id SET DEFAULT nextval('public.solicitacoes_correcao_entrada_id_seq'::regclass);
 
 
 --
@@ -4328,6 +4441,14 @@ ALTER TABLE ONLY public.solicitacoes_cadastro
 
 ALTER TABLE ONLY public.solicitacoes_compra
     ADD CONSTRAINT solicitacoes_compra_pkey PRIMARY KEY (numero, item);
+
+
+--
+-- Name: solicitacoes_correcao_entrada solicitacoes_correcao_entrada_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.solicitacoes_correcao_entrada
+    ADD CONSTRAINT solicitacoes_correcao_entrada_pkey PRIMARY KEY (id);
 
 
 --
@@ -4872,6 +4993,27 @@ CREATE UNIQUE INDEX webauthn_credentials_credential_id_key ON auth.webauthn_cred
 --
 
 CREATE INDEX webauthn_credentials_user_id_idx ON auth.webauthn_credentials USING btree (user_id);
+
+
+--
+-- Name: idx_correcao_entrada_documento; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_correcao_entrada_documento ON public.solicitacoes_correcao_entrada USING btree (numero_documento);
+
+
+--
+-- Name: idx_correcao_entrada_solicitante; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_correcao_entrada_solicitante ON public.solicitacoes_correcao_entrada USING btree (solicitado_por);
+
+
+--
+-- Name: idx_correcao_entrada_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_correcao_entrada_status ON public.solicitacoes_correcao_entrada USING btree (status);
 
 
 --
@@ -5504,5 +5646,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict ZSdQ4YqGDpsddOZKS8Y32gHmaYXvteWT1rNgecv361VR0ZitR0zfxi8gi3ot1Rb
+\unrestrict L6MlVRTJ5cpccndxe1TyHuqdnU93rQTedzJ3tXuDIL2lohEGbVGx6X12zoVveUv
 
