@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 9tUeetCboSmTB1kZFY7PL1cZC3lqLVwQQ6KTP8jhj4ctvPzDI4ggFUuDkNVTQDk
+\restrict sRV5BNw7hzXaL14IOErzfuTeDzTvWXdcMAzeNL2XAGXepfxCAOKIiCtAd6qBgoq
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.9 (Ubuntu 17.9-1.pgdg24.04+1)
@@ -1383,66 +1383,75 @@ CREATE FUNCTION realtime.is_visible_through_filters(columns realtime.wal_column[
 -- Name: list_changes(name, name, integer, integer); Type: FUNCTION; Schema: realtime; Owner: -
 --
 
-CREATE FUNCTION realtime.list_changes(publication name, slot_name name, max_changes integer, max_record_bytes integer) RETURNS SETOF realtime.wal_rls
+CREATE FUNCTION realtime.list_changes(publication name, slot_name name, max_changes integer, max_record_bytes integer) RETURNS TABLE(wal jsonb, is_rls_enabled boolean, subscription_ids uuid[], errors text[], slot_changes_count bigint)
     LANGUAGE sql
     SET log_min_messages TO 'fatal'
     AS $$
-      with pub as (
-        select
-          concat_ws(
-            ',',
-            case when bool_or(pubinsert) then 'insert' else null end,
-            case when bool_or(pubupdate) then 'update' else null end,
-            case when bool_or(pubdelete) then 'delete' else null end
-          ) as w2j_actions,
-          coalesce(
-            string_agg(
-              realtime.quote_wal2json(format('%I.%I', schemaname, tablename)::regclass),
-              ','
-            ) filter (where ppt.tablename is not null and ppt.tablename not like '% %'),
-            ''
-          ) w2j_add_tables
-        from
-          pg_publication pp
-          left join pg_publication_tables ppt
-            on pp.pubname = ppt.pubname
-        where
-          pp.pubname = publication
-        group by
-          pp.pubname
-        limit 1
-      ),
-      w2j as (
-        select
-          x.*, pub.w2j_add_tables
-        from
-          pub,
-          pg_logical_slot_get_changes(
-            slot_name, null, max_changes,
-            'include-pk', 'true',
-            'include-transaction', 'false',
-            'include-timestamp', 'true',
-            'include-type-oids', 'true',
-            'format-version', '2',
-            'actions', pub.w2j_actions,
-            'add-tables', pub.w2j_add_tables
-          ) x
-      )
-      select
-        xyz.wal,
-        xyz.is_rls_enabled,
-        xyz.subscription_ids,
-        xyz.errors
-      from
-        w2j,
-        realtime.apply_rls(
-          wal := w2j.data::jsonb,
-          max_record_bytes := max_record_bytes
-        ) xyz(wal, is_rls_enabled, subscription_ids, errors)
-      where
-        w2j.w2j_add_tables <> ''
-        and xyz.subscription_ids[1] is not null
-    $$;
+  WITH pub AS (
+    SELECT
+      concat_ws(
+        ',',
+        CASE WHEN bool_or(pubinsert) THEN 'insert' ELSE NULL END,
+        CASE WHEN bool_or(pubupdate) THEN 'update' ELSE NULL END,
+        CASE WHEN bool_or(pubdelete) THEN 'delete' ELSE NULL END
+      ) AS w2j_actions,
+      coalesce(
+        string_agg(
+          realtime.quote_wal2json(format('%I.%I', schemaname, tablename)::regclass),
+          ','
+        ) filter (WHERE ppt.tablename IS NOT NULL AND ppt.tablename NOT LIKE '% %'),
+        ''
+      ) AS w2j_add_tables
+    FROM pg_publication pp
+    LEFT JOIN pg_publication_tables ppt ON pp.pubname = ppt.pubname
+    WHERE pp.pubname = publication
+    GROUP BY pp.pubname
+    LIMIT 1
+  ),
+  -- MATERIALIZED ensures pg_logical_slot_get_changes is called exactly once
+  w2j AS MATERIALIZED (
+    SELECT x.*, pub.w2j_add_tables
+    FROM pub,
+         pg_logical_slot_get_changes(
+           slot_name, null, max_changes,
+           'include-pk', 'true',
+           'include-transaction', 'false',
+           'include-timestamp', 'true',
+           'include-type-oids', 'true',
+           'format-version', '2',
+           'actions', pub.w2j_actions,
+           'add-tables', pub.w2j_add_tables
+         ) x
+  ),
+  -- Count raw slot entries before apply_rls/subscription filter
+  slot_count AS (
+    SELECT count(*)::bigint AS cnt
+    FROM w2j
+    WHERE w2j.w2j_add_tables <> ''
+  ),
+  -- Apply RLS and filter as before
+  rls_filtered AS (
+    SELECT xyz.wal, xyz.is_rls_enabled, xyz.subscription_ids, xyz.errors
+    FROM w2j,
+         realtime.apply_rls(
+           wal := w2j.data::jsonb,
+           max_record_bytes := max_record_bytes
+         ) xyz(wal, is_rls_enabled, subscription_ids, errors)
+    WHERE w2j.w2j_add_tables <> ''
+      AND xyz.subscription_ids[1] IS NOT NULL
+  )
+  -- Real rows with slot count attached
+  SELECT rf.wal, rf.is_rls_enabled, rf.subscription_ids, rf.errors, sc.cnt
+  FROM rls_filtered rf, slot_count sc
+
+  UNION ALL
+
+  -- Sentinel row: always returned when no real rows exist so Elixir can
+  -- always read slot_changes_count. Identified by wal IS NULL.
+  SELECT null, null, null, null, sc.cnt
+  FROM slot_count sc
+  WHERE NOT EXISTS (SELECT 1 FROM rls_filtered)
+$$;
 
 
 --
@@ -1611,6 +1620,67 @@ CREATE FUNCTION realtime.topic() RETURNS text
     LANGUAGE sql STABLE
     AS $$
 select nullif(current_setting('realtime.topic', true), '')::text;
+$$;
+
+
+--
+-- Name: allow_any_operation(text[]); Type: FUNCTION; Schema: storage; Owner: -
+--
+
+CREATE FUNCTION storage.allow_any_operation(expected_operations text[]) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+  WITH current_operation AS (
+    SELECT storage.operation() AS raw_operation
+  ),
+  normalized AS (
+    SELECT CASE
+      WHEN raw_operation LIKE 'storage.%' THEN substr(raw_operation, 9)
+      ELSE raw_operation
+    END AS current_operation
+    FROM current_operation
+  )
+  SELECT EXISTS (
+    SELECT 1
+    FROM normalized n
+    CROSS JOIN LATERAL unnest(expected_operations) AS expected_operation
+    WHERE expected_operation IS NOT NULL
+      AND expected_operation <> ''
+      AND n.current_operation = CASE
+        WHEN expected_operation LIKE 'storage.%' THEN substr(expected_operation, 9)
+        ELSE expected_operation
+      END
+  );
+$$;
+
+
+--
+-- Name: allow_only_operation(text); Type: FUNCTION; Schema: storage; Owner: -
+--
+
+CREATE FUNCTION storage.allow_only_operation(expected_operation text) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+  WITH current_operation AS (
+    SELECT storage.operation() AS raw_operation
+  ),
+  normalized AS (
+    SELECT
+      CASE
+        WHEN raw_operation LIKE 'storage.%' THEN substr(raw_operation, 9)
+        ELSE raw_operation
+      END AS current_operation,
+      CASE
+        WHEN expected_operation LIKE 'storage.%' THEN substr(expected_operation, 9)
+        ELSE expected_operation
+      END AS requested_operation
+    FROM current_operation
+  )
+  SELECT CASE
+    WHEN requested_operation IS NULL OR requested_operation = '' THEN FALSE
+    ELSE COALESCE(current_operation = requested_operation, FALSE)
+  END
+  FROM normalized;
 $$;
 
 
@@ -3327,6 +3397,52 @@ ALTER SEQUENCE public.log_alteracoes_estoque_id_seq OWNED BY public.log_alteraco
 
 
 --
+-- Name: log_alteracoes_quantidade_sc; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.log_alteracoes_quantidade_sc (
+    id integer NOT NULL,
+    sc_numero text NOT NULL,
+    sc_item integer NOT NULL,
+    cod_material text,
+    descricao_material text,
+    quantidade_anterior numeric(15,4) NOT NULL,
+    quantidade_nova numeric(15,4) NOT NULL,
+    justificativa text NOT NULL,
+    alterado_por text NOT NULL,
+    data_alteracao timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: TABLE log_alteracoes_quantidade_sc; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.log_alteracoes_quantidade_sc IS 'Auditoria de alterações de quantidade de itens de Solicitação de Compra.
+     Cada linha registra quem alterou, de qual valor para qual valor e com qual justificativa.';
+
+
+--
+-- Name: log_alteracoes_quantidade_sc_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.log_alteracoes_quantidade_sc_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: log_alteracoes_quantidade_sc_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.log_alteracoes_quantidade_sc_id_seq OWNED BY public.log_alteracoes_quantidade_sc.id;
+
+
+--
 -- Name: materiais; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -3910,7 +4026,8 @@ CREATE TABLE storage.s3_multipart_uploads (
     version text NOT NULL,
     owner_id text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    user_metadata jsonb
+    user_metadata jsonb,
+    metadata jsonb
 );
 
 
@@ -3982,6 +4099,13 @@ ALTER TABLE ONLY public.historico_status_compra ALTER COLUMN id SET DEFAULT next
 --
 
 ALTER TABLE ONLY public.log_alteracoes_estoque ALTER COLUMN id SET DEFAULT nextval('public.log_alteracoes_estoque_id_seq'::regclass);
+
+
+--
+-- Name: log_alteracoes_quantidade_sc id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.log_alteracoes_quantidade_sc ALTER COLUMN id SET DEFAULT nextval('public.log_alteracoes_quantidade_sc_id_seq'::regclass);
 
 
 --
@@ -4347,6 +4471,14 @@ ALTER TABLE ONLY public.localizacoes
 
 ALTER TABLE ONLY public.log_alteracoes_estoque
     ADD CONSTRAINT log_alteracoes_estoque_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: log_alteracoes_quantidade_sc log_alteracoes_quantidade_sc_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.log_alteracoes_quantidade_sc
+    ADD CONSTRAINT log_alteracoes_quantidade_sc_pkey PRIMARY KEY (id);
 
 
 --
@@ -5011,6 +5143,20 @@ CREATE INDEX idx_hist_status_usuario ON public.historico_status_compra USING btr
 
 
 --
+-- Name: idx_log_qtd_sc; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_log_qtd_sc ON public.log_alteracoes_quantidade_sc USING btree (sc_numero, sc_item);
+
+
+--
+-- Name: idx_log_qtd_usuario; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_log_qtd_usuario ON public.log_alteracoes_quantidade_sc USING btree (alterado_por);
+
+
+--
 -- Name: idx_materiais_categoria; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5584,5 +5730,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 9tUeetCboSmTB1kZFY7PL1cZC3lqLVwQQ6KTP8jhj4ctvPzDI4ggFUuDkNVTQDk
+\unrestrict sRV5BNw7hzXaL14IOErzfuTeDzTvWXdcMAzeNL2XAGXepfxCAOKIiCtAd6qBgoq
 
