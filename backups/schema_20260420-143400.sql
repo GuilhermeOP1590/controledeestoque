@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict VzSLcCkgEmJzEyT9CecHpI83fqNrZJuolGXJ1pF39ONrPzsfWtRuoorqclLw60Q
+\restrict 41PFeka14m4OHtlio8TF2jkyeCtgrHjuLRDrbG5hvC9VTrsjJqY4bP2Cfp4YLQu
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.9 (Ubuntu 17.9-1.pgdg24.04+1)
@@ -3546,7 +3546,8 @@ CREATE TABLE public.solicitacoes_compra (
     observacao text DEFAULT ''::text,
     nota_fiscal text DEFAULT ''::text,
     valor_unitario_orcado numeric(14,2),
-    valor_total_orcado numeric(14,2)
+    valor_total_orcado numeric(14,2),
+    comprador_designado text DEFAULT ''::text
 );
 
 
@@ -3684,6 +3685,11 @@ CREATE VIEW public.solicitacoes_compra_resumo AS
            FROM public.solicitacoes_compra
           WHERE ((solicitacoes_compra.comprador IS NOT NULL) AND (solicitacoes_compra.comprador <> ''::text))
           GROUP BY solicitacoes_compra.numero
+        ), designado_sc AS (
+         SELECT solicitacoes_compra.numero,
+            max(solicitacoes_compra.comprador_designado) AS comprador_designado
+           FROM public.solicitacoes_compra
+          GROUP BY solicitacoes_compra.numero
         ), dados_cabecalho AS (
          SELECT DISTINCT ON (solicitacoes_compra.numero) solicitacoes_compra.numero,
             solicitacoes_compra.ordem_servico,
@@ -3705,10 +3711,12 @@ CREATE VIEW public.solicitacoes_compra_resumo AS
     dc.criticidade,
     ss.status_calculado AS status,
     COALESCE(cs.compradores_lista, ''::text) AS comprador,
+    COALESCE(ds.comprador_designado, ''::text) AS comprador_designado,
     dc.atividade
-   FROM ((dados_cabecalho dc
+   FROM (((dados_cabecalho dc
      JOIN status_sc ss ON ((ss.numero = dc.numero)))
-     LEFT JOIN compradores_sc cs ON ((cs.numero = dc.numero)));
+     LEFT JOIN compradores_sc cs ON ((cs.numero = dc.numero)))
+     LEFT JOIN designado_sc ds ON ((ds.numero = dc.numero)));
 
 
 --
@@ -5730,5 +5738,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict VzSLcCkgEmJzEyT9CecHpI83fqNrZJuolGXJ1pF39ONrPzsfWtRuoorqclLw60Q
+\unrestrict 41PFeka14m4OHtlio8TF2jkyeCtgrHjuLRDrbG5hvC9VTrsjJqY4bP2Cfp4YLQu
 
