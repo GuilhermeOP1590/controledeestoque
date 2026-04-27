@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict SEVpjZeGnW2fzHCQgeI6yS03mT86tBsYwicAzKRAMfjrZzvvHgMePj86h9k0iT2
+\restrict Yw1tPN9Vo6CftWQFd5NIumvc2NVrxhTUhkieh4rEKvJhgLoOOaGmQ1sdqZ7toWC
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.9 (Ubuntu 17.9-1.pgdg24.04+1)
@@ -73,20 +73,6 @@ CREATE SCHEMA storage;
 --
 
 CREATE SCHEMA vault;
-
-
---
--- Name: pg_graphql; Type: EXTENSION; Schema: -; Owner: -
---
-
-CREATE EXTENSION IF NOT EXISTS pg_graphql WITH SCHEMA graphql;
-
-
---
--- Name: EXTENSION pg_graphql; Type: COMMENT; Schema: -; Owner: -
---
-
-COMMENT ON EXTENSION pg_graphql IS 'pg_graphql: GraphQL support';
 
 
 --
@@ -692,6 +678,39 @@ $_$;
 --
 
 COMMENT ON FUNCTION extensions.set_graphql_placeholder() IS 'Reintroduces placeholder function for graphql_public.graphql';
+
+
+--
+-- Name: graphql(text, text, jsonb, jsonb); Type: FUNCTION; Schema: graphql_public; Owner: -
+--
+
+CREATE FUNCTION graphql_public.graphql("operationName" text DEFAULT NULL::text, query text DEFAULT NULL::text, variables jsonb DEFAULT NULL::jsonb, extensions jsonb DEFAULT NULL::jsonb) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $$
+            DECLARE
+                server_version float;
+            BEGIN
+                server_version = (SELECT (SPLIT_PART((select version()), ' ', 2))::float);
+
+                IF server_version >= 14 THEN
+                    RETURN jsonb_build_object(
+                        'errors', jsonb_build_array(
+                            jsonb_build_object(
+                                'message', 'pg_graphql extension is not enabled.'
+                            )
+                        )
+                    );
+                ELSE
+                    RETURN jsonb_build_object(
+                        'errors', jsonb_build_array(
+                            jsonb_build_object(
+                                'message', 'pg_graphql is only available on projects running Postgres 14 onwards.'
+                            )
+                        )
+                    );
+                END IF;
+            END;
+        $$;
 
 
 --
@@ -3546,7 +3565,8 @@ CREATE TABLE public.solicitacoes_compra (
     observacao text DEFAULT ''::text,
     nota_fiscal text DEFAULT ''::text,
     valor_unitario_orcado numeric(14,2),
-    valor_total_orcado numeric(14,2)
+    valor_total_orcado numeric(14,2),
+    comprador_designado text DEFAULT ''::text
 );
 
 
@@ -3684,6 +3704,11 @@ CREATE VIEW public.solicitacoes_compra_resumo AS
            FROM public.solicitacoes_compra
           WHERE ((solicitacoes_compra.comprador IS NOT NULL) AND (solicitacoes_compra.comprador <> ''::text))
           GROUP BY solicitacoes_compra.numero
+        ), designado_sc AS (
+         SELECT solicitacoes_compra.numero,
+            max(solicitacoes_compra.comprador_designado) AS comprador_designado
+           FROM public.solicitacoes_compra
+          GROUP BY solicitacoes_compra.numero
         ), dados_cabecalho AS (
          SELECT DISTINCT ON (solicitacoes_compra.numero) solicitacoes_compra.numero,
             solicitacoes_compra.ordem_servico,
@@ -3705,10 +3730,12 @@ CREATE VIEW public.solicitacoes_compra_resumo AS
     dc.criticidade,
     ss.status_calculado AS status,
     COALESCE(cs.compradores_lista, ''::text) AS comprador,
+    COALESCE(ds.comprador_designado, ''::text) AS comprador_designado,
     dc.atividade
-   FROM ((dados_cabecalho dc
+   FROM (((dados_cabecalho dc
      JOIN status_sc ss ON ((ss.numero = dc.numero)))
-     LEFT JOIN compradores_sc cs ON ((cs.numero = dc.numero)));
+     LEFT JOIN compradores_sc cs ON ((cs.numero = dc.numero)))
+     LEFT JOIN designado_sc ds ON ((ds.numero = dc.numero)));
 
 
 --
@@ -5730,5 +5757,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict SEVpjZeGnW2fzHCQgeI6yS03mT86tBsYwicAzKRAMfjrZzvvHgMePj86h9k0iT2
+\unrestrict Yw1tPN9Vo6CftWQFd5NIumvc2NVrxhTUhkieh4rEKvJhgLoOOaGmQ1sdqZ7toWC
 
