@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict dknlaBnDcnvqB33xaANr5JeZ2B33t2KUIz1GUONCp33Zuo2DOUskm8wtL8A2zIY
+\restrict 9juBEBgGkVV0dj8eSAf9ltOLYqN4LdSAhH9VaRaAePMJAMXDIJLbqQlihyvqSHl
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.9 (Ubuntu 17.9-1.pgdg24.04+1)
@@ -73,20 +73,6 @@ CREATE SCHEMA storage;
 --
 
 CREATE SCHEMA vault;
-
-
---
--- Name: pg_graphql; Type: EXTENSION; Schema: -; Owner: -
---
-
-CREATE EXTENSION IF NOT EXISTS pg_graphql WITH SCHEMA graphql;
-
-
---
--- Name: EXTENSION pg_graphql; Type: COMMENT; Schema: -; Owner: -
---
-
-COMMENT ON EXTENSION pg_graphql IS 'pg_graphql: GraphQL support';
 
 
 --
@@ -692,6 +678,39 @@ $_$;
 --
 
 COMMENT ON FUNCTION extensions.set_graphql_placeholder() IS 'Reintroduces placeholder function for graphql_public.graphql';
+
+
+--
+-- Name: graphql(text, text, jsonb, jsonb); Type: FUNCTION; Schema: graphql_public; Owner: -
+--
+
+CREATE FUNCTION graphql_public.graphql("operationName" text DEFAULT NULL::text, query text DEFAULT NULL::text, variables jsonb DEFAULT NULL::jsonb, extensions jsonb DEFAULT NULL::jsonb) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $$
+            DECLARE
+                server_version float;
+            BEGIN
+                server_version = (SELECT (SPLIT_PART((select version()), ' ', 2))::float);
+
+                IF server_version >= 14 THEN
+                    RETURN jsonb_build_object(
+                        'errors', jsonb_build_array(
+                            jsonb_build_object(
+                                'message', 'pg_graphql extension is not enabled.'
+                            )
+                        )
+                    );
+                ELSE
+                    RETURN jsonb_build_object(
+                        'errors', jsonb_build_array(
+                            jsonb_build_object(
+                                'message', 'pg_graphql is only available on projects running Postgres 14 onwards.'
+                            )
+                        )
+                    );
+                END IF;
+            END;
+        $$;
 
 
 --
@@ -5738,5 +5757,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict dknlaBnDcnvqB33xaANr5JeZ2B33t2KUIz1GUONCp33Zuo2DOUskm8wtL8A2zIY
+\unrestrict 9juBEBgGkVV0dj8eSAf9ltOLYqN4LdSAhH9VaRaAePMJAMXDIJLbqQlihyvqSHl
 
