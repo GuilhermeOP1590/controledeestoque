@@ -2,10 +2,10 @@
 -- PostgreSQL database dump
 --
 
-\restrict QKczaeRWJAgu8S9bJ0hNCBc7ctaq3LlpeJ4l1INXvwOPgErYilhoCW98Ahpfk2l
+\restrict Boy7dflyVDyey06H8Dic8h3xJfCB7S3ZBaXfDT3cAapLlZ5eDhknGo3ihEoGX0d
 
 -- Dumped from database version 17.6
--- Dumped by pg_dump version 17.9 (Ubuntu 17.9-1.pgdg24.04+1)
+-- Dumped by pg_dump version 17.10 (Ubuntu 17.10-1.pgdg24.04+1)
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -3570,7 +3570,9 @@ CREATE TABLE public.solicitacoes_compra (
     nota_fiscal text DEFAULT ''::text,
     valor_unitario_orcado numeric(14,2),
     valor_total_orcado numeric(14,2),
-    comprador_designado text DEFAULT ''::text
+    comprador_designado text DEFAULT ''::text,
+    suprir_estoque boolean DEFAULT false,
+    cd_destino text
 );
 
 
@@ -5761,5 +5763,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict QKczaeRWJAgu8S9bJ0hNCBc7ctaq3LlpeJ4l1INXvwOPgErYilhoCW98Ahpfk2l
+\unrestrict Boy7dflyVDyey06H8Dic8h3xJfCB7S3ZBaXfDT3cAapLlZ5eDhknGo3ihEoGX0d
 
