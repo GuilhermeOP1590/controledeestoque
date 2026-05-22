@@ -2,10 +2,10 @@
 -- PostgreSQL database dump
 --
 
-\restrict AwD5yIV2J7JTnmCgypfQrokNggVLmijTfwGfCbpC7O7Us2XCH7nEIDHsiyGqrpu
+\restrict alf2nVNsJ7SWauCecnpkDuV4WoA1nOE9SC67Q5xcpK7JLZReVdF5o6Wo8HKdIqb
 
 -- Dumped from database version 17.6
--- Dumped by pg_dump version 17.9 (Ubuntu 17.9-1.pgdg24.04+1)
+-- Dumped by pg_dump version 17.10 (Ubuntu 17.10-1.pgdg24.04+1)
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -3242,7 +3242,11 @@ CREATE TABLE public.entradas (
     cod_cd text DEFAULT 'MG'::text,
     valor_total_nf numeric(14,2) DEFAULT 0,
     numero_solicitacao text,
-    data_lancamento date
+    data_lancamento date,
+    tipo_entrada text DEFAULT 'COM_NF'::text NOT NULL,
+    motivo_categoria text,
+    justificativa_detalhe text,
+    CONSTRAINT chk_entradas_tipo_entrada CHECK ((tipo_entrada = ANY (ARRAY['COM_NF'::text, 'SEM_NF'::text])))
 );
 
 
@@ -3570,7 +3574,9 @@ CREATE TABLE public.solicitacoes_compra (
     nota_fiscal text DEFAULT ''::text,
     valor_unitario_orcado numeric(14,2),
     valor_total_orcado numeric(14,2),
-    comprador_designado text DEFAULT ''::text
+    comprador_designado text DEFAULT ''::text,
+    suprir_estoque boolean DEFAULT false,
+    cd_destino text
 );
 
 
@@ -5139,6 +5145,13 @@ CREATE INDEX idx_entradas_numero_sc ON public.entradas USING btree (numero_solic
 
 
 --
+-- Name: idx_entradas_tipo_lancamento; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_entradas_tipo_lancamento ON public.entradas USING btree (tipo_entrada, data_lancamento);
+
+
+--
 -- Name: idx_fornecedores_cnpj; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5761,5 +5774,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict AwD5yIV2J7JTnmCgypfQrokNggVLmijTfwGfCbpC7O7Us2XCH7nEIDHsiyGqrpu
+\unrestrict alf2nVNsJ7SWauCecnpkDuV4WoA1nOE9SC67Q5xcpK7JLZReVdF5o6Wo8HKdIqb
 
