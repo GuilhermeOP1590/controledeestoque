@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict Boy7dflyVDyey06H8Dic8h3xJfCB7S3ZBaXfDT3cAapLlZ5eDhknGo3ihEoGX0d
+\restrict UT2XtIl9U8bZgPQglOXmAfRTb0xUBifp9IT192vS27UD2ahnQbWOkr6a4ltRjkY
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.10 (Ubuntu 17.10-1.pgdg24.04+1)
@@ -3242,7 +3242,11 @@ CREATE TABLE public.entradas (
     cod_cd text DEFAULT 'MG'::text,
     valor_total_nf numeric(14,2) DEFAULT 0,
     numero_solicitacao text,
-    data_lancamento date
+    data_lancamento date,
+    tipo_entrada text DEFAULT 'COM_NF'::text NOT NULL,
+    motivo_categoria text,
+    justificativa_detalhe text,
+    CONSTRAINT chk_entradas_tipo_entrada CHECK ((tipo_entrada = ANY (ARRAY['COM_NF'::text, 'SEM_NF'::text])))
 );
 
 
@@ -5141,6 +5145,13 @@ CREATE INDEX idx_entradas_numero_sc ON public.entradas USING btree (numero_solic
 
 
 --
+-- Name: idx_entradas_tipo_lancamento; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_entradas_tipo_lancamento ON public.entradas USING btree (tipo_entrada, data_lancamento);
+
+
+--
 -- Name: idx_fornecedores_cnpj; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5763,5 +5774,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict Boy7dflyVDyey06H8Dic8h3xJfCB7S3ZBaXfDT3cAapLlZ5eDhknGo3ihEoGX0d
+\unrestrict UT2XtIl9U8bZgPQglOXmAfRTb0xUBifp9IT192vS27UD2ahnQbWOkr6a4ltRjkY
 
