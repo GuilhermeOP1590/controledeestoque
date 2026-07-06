@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict PaHK0tJct5wboaabhUgtwwy7ubVgYbh1NEN9N91CPmdCMPdmoGNhYf4Laxd7MvI
+\restrict sszBXBvhTexW5ScFwlZOy6JL69WjHM0if4alJYf1OGXwLnquejhK6TI3Iu6buFh
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.10 (Ubuntu 17.10-1.pgdg24.04+1)
@@ -2744,6 +2744,7 @@ CREATE TABLE auth.custom_oauth_providers (
     jwks_uri text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    custom_claims_allowlist text[] DEFAULT '{}'::text[] NOT NULL,
     CONSTRAINT custom_oauth_providers_authorization_url_https CHECK (((authorization_url IS NULL) OR (authorization_url ~~ 'https://%'::text))),
     CONSTRAINT custom_oauth_providers_authorization_url_length CHECK (((authorization_url IS NULL) OR (char_length(authorization_url) <= 2048))),
     CONSTRAINT custom_oauth_providers_client_id_length CHECK (((char_length(client_id) >= 1) AND (char_length(client_id) <= 512))),
@@ -5925,5 +5926,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict PaHK0tJct5wboaabhUgtwwy7ubVgYbh1NEN9N91CPmdCMPdmoGNhYf4Laxd7MvI
+\unrestrict sszBXBvhTexW5ScFwlZOy6JL69WjHM0if4alJYf1OGXwLnquejhK6TI3Iu6buFh
 
