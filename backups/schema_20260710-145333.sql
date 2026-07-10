@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 5BF7nPvmQeWqoGelT6Df6xwqm2EgYcwCsCnJ4LTKtoagCZTLPiHY1jB6yXhdz7i
+\restrict kyrlaH4zN8TgXDnGYWPacvW1tUweRq8ao8orSOxY39T6X4FUfLpBurRJ40iyM39
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.10 (Ubuntu 17.10-1.pgdg24.04+1)
@@ -5926,5 +5926,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 5BF7nPvmQeWqoGelT6Df6xwqm2EgYcwCsCnJ4LTKtoagCZTLPiHY1jB6yXhdz7i
+\unrestrict kyrlaH4zN8TgXDnGYWPacvW1tUweRq8ao8orSOxY39T6X4FUfLpBurRJ40iyM39
 
