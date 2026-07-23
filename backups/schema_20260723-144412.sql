@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict mdRqtDhS52nKRqg5Bnoxpfd0nQlvq0OVBmNqIzWmIt72sm1OTOCL8PhIsSpW5H4
+\restrict CbINkgCB8DkO15Meqd7cmeGcKkg4nT1wJY8vSrLA2ebRdilsOZ5dtpzJ67ThOte
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.10 (Ubuntu 17.10-1.pgdg24.04+1)
@@ -269,7 +269,8 @@ CREATE TYPE realtime.equality_op AS ENUM (
 CREATE TYPE realtime.user_defined_filter AS (
 	column_name text,
 	op realtime.equality_op,
-	value text
+	value text,
+	negate boolean
 );
 
 
@@ -1235,6 +1236,18 @@ begin
 
                     execute 'execute walrus_rls_stmt' into subscription_has_access;
 
+                    -- Reset the role on every FOR..LOOP batch execution.
+                    -- The first batch of 10 rows is pre-fetched using the current connection role (PG internal behaviour)
+                    -- then we have to reset it again otherwise it would use the role defined in the `set_config` above
+                    -- to fetch the remaining rows when rows>10, which could be a user-defined role that lacks execution grants.
+                    -- The flow is:
+                    --   1. run batch with conn role
+                    --   2. set_config working_role
+                    --   3. execute walrus
+                    --   4. reset role (revert)
+                    --   5. repeat
+                    perform set_config('role', null, true);
+
                     if subscription_has_access then
                         visible_role_sub_ids = visible_role_sub_ids || subscription_id;
                     end if;
@@ -1493,39 +1506,105 @@ $$;
 
 
 --
+-- Name: check_equality_op(realtime.equality_op, regtype, text, text, boolean); Type: FUNCTION; Schema: realtime; Owner: -
+--
+
+CREATE FUNCTION realtime.check_equality_op(op realtime.equality_op, type_ regtype, val_1 text, val_2 text, negate boolean) RETURNS boolean
+    LANGUAGE plpgsql STABLE
+    AS $$
+declare
+    op_symbol text;
+    res boolean;
+begin
+    -- IS DISTINCT FROM / IS NOT DISTINCT FROM: infix, both sides typed literals
+    if op = 'isdistinct' then
+        execute format(
+            'select %L::%s %s %L::%s',
+            val_1,
+            type_::text,
+            case when negate then 'IS NOT DISTINCT FROM' else 'IS DISTINCT FROM' end,
+            val_2,
+            type_::text
+        ) into res;
+        return res;
+    end if;
+
+    -- IS requires a keyword RHS (NULL, TRUE, FALSE, UNKNOWN), not a typed literal
+    if op = 'is' then
+        if val_2 not in ('null', 'true', 'false', 'unknown') then
+            raise exception 'invalid value for is filter: must be null, true, false, or unknown';
+        end if;
+        execute format(
+            'select %L::%s %s %s',
+            val_1,
+            type_::text,
+            case when negate then 'IS NOT' else 'IS' end,
+            upper(val_2)
+        ) into res;
+        return res;
+    end if;
+
+    op_symbol = case
+        when op = 'eq'    then '='
+        when op = 'neq'   then '!='
+        when op = 'lt'    then '<'
+        when op = 'lte'   then '<='
+        when op = 'gt'    then '>'
+        when op = 'gte'   then '>='
+        when op = 'in'    then '= any'
+        when op = 'like'   then 'LIKE'
+        when op = 'ilike'  then 'ILIKE'
+        when op = 'match'  then '~'
+        when op = 'imatch' then '~*'
+        else null
+    end;
+
+    if op_symbol is null then
+        raise exception 'unsupported equality operator: %', op::text;
+    end if;
+
+    execute format(
+        'select %L::%s %s (%L::%s)',
+        val_1,
+        type_::text,
+        op_symbol,
+        val_2,
+        case when op = 'in' then type_::text || '[]' else type_::text end
+    ) into res;
+
+    return case when negate then not res else res end;
+end;
+$$;
+
+
+--
 -- Name: is_visible_through_filters(realtime.wal_column[], realtime.user_defined_filter[]); Type: FUNCTION; Schema: realtime; Owner: -
 --
 
 CREATE FUNCTION realtime.is_visible_through_filters(columns realtime.wal_column[], filters realtime.user_defined_filter[]) RETURNS boolean
-    LANGUAGE sql IMMUTABLE
-    AS $_$
-/*
-Should the record be visible (true) or filtered out (false) after *filters* are applied
-*/
+    LANGUAGE sql STABLE
+    AS $$
     select
-        -- Default to allowed when no filters present
-        $2 is null -- no filters. this should not happen because subscriptions has a default
-        or array_length($2, 1) is null -- array length of an empty array is null
-        or bool_and(
-            coalesce(
+        filters is null
+        or array_length(filters, 1) is null
+        or coalesce(
+            count(col.name) = count(1)
+            and sum(
                 realtime.check_equality_op(
                     op:=f.op,
-                    type_:=coalesce(
-                        col.type_oid::regtype, -- null when wal2json version <= 2.4
-                        col.type_name::regtype
-                    ),
-                    -- cast jsonb to text
+                    type_:=coalesce(col.type_oid::regtype, col.type_name::regtype),
                     val_1:=col.value #>> '{}',
-                    val_2:=f.value
-                ),
-                false -- if null, filter does not match
-            )
+                    val_2:=f.value,
+                    negate:=coalesce(f.negate, false)
+                )::int
+            ) filter (where col.name is not null) = count(col.name),
+            false
         )
     from
         unnest(filters) f
-        join unnest(columns) col
+        left join unnest(columns) col
             on f.column_name = col.name;
-$_$;
+$$;
 
 
 --
@@ -1723,7 +1802,48 @@ begin
             if coalesce(jsonb_array_length(in_val), 0) > 100 then
                 raise exception 'too many values for `in` filter. Maximum 100';
             end if;
+        elsif filter.op = 'is'::realtime.equality_op then
+            -- `is` requires a keyword RHS rather than a typed literal
+            if filter.value not in ('null', 'true', 'false', 'unknown') then
+                raise exception 'invalid value for is filter: must be null, true, false, or unknown';
+            end if;
+            -- IS NULL works for any type, but IS TRUE/FALSE/UNKNOWN require a boolean
+            -- operand. Reject the non-null keywords on non-boolean columns here so they
+            -- don't abort apply_rls at WAL time.
+            if filter.value <> 'null' and col_type <> 'boolean'::regtype then
+                raise exception 'is % filter requires a boolean column, got %', filter.value, col_type::text;
+            end if;
+        elsif filter.op in ('like'::realtime.equality_op, 'ilike'::realtime.equality_op) then
+            -- like/ilike apply the text pattern operator (~~); reject column types that
+            -- have no such operator instead of failing at WAL time
+            if not exists (
+                select 1 from pg_catalog.pg_operator
+                where oprname = '~~' and oprleft = col_type
+            ) then
+                raise exception 'operator % requires a text-compatible column type, got %', filter.op::text, col_type::text;
+            end if;
+        elsif filter.op in ('match'::realtime.equality_op, 'imatch'::realtime.equality_op) then
+            -- match/imatch apply the regex operators ~ / ~*; reject column types that have
+            -- no such operator (e.g. integer) instead of failing at WAL time, mirroring the
+            -- like/ilike guard above.
+            if not exists (
+                select 1 from pg_catalog.pg_operator
+                where oprname = case when filter.op = 'imatch'::realtime.equality_op then '~*' else '~' end
+                  and oprleft = col_type
+                  and oprright = col_type
+                  and oprresult = 'boolean'::regtype
+            ) then
+                raise exception 'operator % requires a text-compatible column type, got %', filter.op::text, col_type::text;
+            end if;
+            -- validate the regex eagerly so a bad pattern is rejected here, not inside
+            -- apply_rls where it would abort the WAL stream for the entity
+            begin
+                perform '' ~ filter.value;
+            exception when others then
+                raise exception 'invalid regular expression for % filter: %', filter.op::text, sqlerrm;
+            end;
         else
+            -- eq/neq/lt/lte/gt/gte: value must be coercable to the type
             perform realtime.cast(filter.value, col_type);
         end if;
     end loop;
@@ -1736,8 +1856,10 @@ begin
         end loop;
     end if;
 
+    -- Apply consistent order to filters so the unique constraint can't be tricked by a
+    -- different filter order. negate is part of the sort key.
     new.filters = coalesce(
-        array_agg(f order by f.column_name, f.op, f.value),
+        array_agg(f order by f.column_name, f.op, f.value, f.negate),
         '{}'
     ) from unnest(new.filters) f;
 
@@ -5926,5 +6048,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict mdRqtDhS52nKRqg5Bnoxpfd0nQlvq0OVBmNqIzWmIt72sm1OTOCL8PhIsSpW5H4
+\unrestrict CbINkgCB8DkO15Meqd7cmeGcKkg4nT1wJY8vSrLA2ebRdilsOZ5dtpzJ67ThOte
 
