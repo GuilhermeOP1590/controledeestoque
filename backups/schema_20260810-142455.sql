@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict nPI98l1rT2OZ4O2AJGgF6hDRASBq2C3bswTJPcTfDhmJbwhoPdZkF9LAIwa2cVR
+\restrict HM7bMXEzRKVnjAgMeJEfYsYPmKVhuIw12goCeIsCzlkm93fwetHZOvbHccJ0ky5
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.10 (Ubuntu 17.10-1.pgdg24.04+1)
@@ -872,6 +872,20 @@ BEGIN
     RETURN (v_max + 1)::TEXT;
 END;
 $$;
+
+
+--
+-- Name: gerar_proximo_codigo_subconjunto(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.gerar_proximo_codigo_subconjunto() RETURNS integer
+    LANGUAGE plpgsql
+    AS $$
+DECLARE v_max INTEGER;
+BEGIN
+    SELECT MAX(codigo) INTO v_max FROM subconjuntos;
+    RETURN COALESCE(v_max, 0) + 10;
+END; $$;
 
 
 --
@@ -3751,7 +3765,8 @@ CREATE TABLE public.materiais (
     estoque_minimo double precision DEFAULT 0,
     indicador double precision DEFAULT 0,
     estoque_maximo double precision DEFAULT 0,
-    classificacao text DEFAULT 'D'::text
+    classificacao text DEFAULT 'D'::text,
+    cod_subconjunto integer
 );
 
 
@@ -4054,6 +4069,19 @@ CREATE SEQUENCE public.solicitacoes_correcao_entrada_id_seq
 --
 
 ALTER SEQUENCE public.solicitacoes_correcao_entrada_id_seq OWNED BY public.solicitacoes_correcao_entrada.id;
+
+
+--
+-- Name: subconjuntos; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.subconjuntos (
+    codigo integer NOT NULL,
+    cod_categoria integer NOT NULL,
+    nome text NOT NULL,
+    ativo boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
 
 
 --
@@ -4825,6 +4853,14 @@ ALTER TABLE ONLY public.solicitacoes_correcao_entrada
 
 
 --
+-- Name: subconjuntos subconjuntos_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.subconjuntos
+    ADD CONSTRAINT subconjuntos_pkey PRIMARY KEY (codigo);
+
+
+--
 -- Name: tipos_localizacao tipos_localizacao_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -5482,6 +5518,13 @@ CREATE INDEX idx_materiais_categoria ON public.materiais USING btree (categoria)
 
 
 --
+-- Name: idx_materiais_cod_subconjunto; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_materiais_cod_subconjunto ON public.materiais USING btree (cod_subconjunto);
+
+
+--
 -- Name: idx_materiais_descricao; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5521,6 +5564,20 @@ CREATE INDEX idx_solicitacoes_compra_data ON public.solicitacoes_compra USING bt
 --
 
 CREATE INDEX idx_solicitacoes_compra_numero ON public.solicitacoes_compra USING btree (numero);
+
+
+--
+-- Name: idx_subconjuntos_categoria; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_subconjuntos_categoria ON public.subconjuntos USING btree (cod_categoria);
+
+
+--
+-- Name: uq_subconjuntos_nome_categoria; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_subconjuntos_nome_categoria ON public.subconjuntos USING btree (cod_categoria, upper(nome));
 
 
 --
@@ -5780,6 +5837,22 @@ ALTER TABLE ONLY auth.webauthn_credentials
 
 
 --
+-- Name: materiais materiais_cod_subconjunto_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.materiais
+    ADD CONSTRAINT materiais_cod_subconjunto_fkey FOREIGN KEY (cod_subconjunto) REFERENCES public.subconjuntos(codigo);
+
+
+--
+-- Name: subconjuntos subconjuntos_cod_categoria_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.subconjuntos
+    ADD CONSTRAINT subconjuntos_cod_categoria_fkey FOREIGN KEY (cod_categoria) REFERENCES public.categorias(codigo);
+
+
+--
 -- Name: usuario_transacoes usuario_transacoes_transacao_codigo_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -5932,6 +6005,12 @@ ALTER TABLE auth.sso_providers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE auth.users ENABLE ROW LEVEL SECURITY;
 
 --
+-- Name: subconjuntos; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.subconjuntos ENABLE ROW LEVEL SECURITY;
+
+--
 -- Name: messages; Type: ROW SECURITY; Schema: realtime; Owner: -
 --
 
@@ -6048,5 +6127,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict nPI98l1rT2OZ4O2AJGgF6hDRASBq2C3bswTJPcTfDhmJbwhoPdZkF9LAIwa2cVR
+\unrestrict HM7bMXEzRKVnjAgMeJEfYsYPmKVhuIw12goCeIsCzlkm93fwetHZOvbHccJ0ky5
 
