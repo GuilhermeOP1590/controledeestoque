@@ -2,10 +2,10 @@
 -- PostgreSQL database dump
 --
 
-\restrict XEdR19le2ztpRoiOcXlRE9qKBJ0gKAsbxmmDEy7K2j8LyIDpPg5kmxYuy3dxidF
+\restrict 9IvySju2gZnl5KKLaenkv6qxWp8bitOot26TK6dlP1TMXrrtgitu4MPxBjmzQej
 
 -- Dumped from database version 17.6
--- Dumped by pg_dump version 17.10 (Ubuntu 17.10-1.pgdg24.04+1)
+-- Dumped by pg_dump version 17.11 (Ubuntu 17.11-1.pgdg24.04+2)
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -802,20 +802,6 @@ $$;
 
 
 --
--- Name: gerar_proximo_codigo_aplicacao(); Type: FUNCTION; Schema: public; Owner: -
---
-
-CREATE FUNCTION public.gerar_proximo_codigo_aplicacao() RETURNS integer
-    LANGUAGE plpgsql
-    AS $$
-DECLARE v_max INTEGER;
-BEGIN
-    SELECT MAX(codigo) INTO v_max FROM aplicacoes;
-    RETURN COALESCE(v_max, 0) + 10;
-END; $$;
-
-
---
 -- Name: gerar_proximo_codigo_categoria(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -830,20 +816,6 @@ BEGIN
     RETURN v_max + 10;
 END;
 $$;
-
-
---
--- Name: gerar_proximo_codigo_classificacao_macro(); Type: FUNCTION; Schema: public; Owner: -
---
-
-CREATE FUNCTION public.gerar_proximo_codigo_classificacao_macro() RETURNS integer
-    LANGUAGE plpgsql
-    AS $$
-DECLARE v_max INTEGER;
-BEGIN
-    SELECT MAX(codigo) INTO v_max FROM classificacoes_macro;
-    RETURN COALESCE(v_max, 0) + 10;
-END; $$;
 
 
 --
@@ -1050,38 +1022,6 @@ BEGIN
     PERFORM setval('entradas_id_seq', COALESCE((SELECT MAX(id) FROM entradas), 0));
 END;
 $$;
-
-
---
--- Name: trg_criar_aplicacao_generica(); Type: FUNCTION; Schema: public; Owner: -
---
-
-CREATE FUNCTION public.trg_criar_aplicacao_generica() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-BEGIN
-    IF NEW.codigo = 0 THEN RETURN NEW; END IF;
-    INSERT INTO aplicacoes (codigo, cod_subconjunto, nome)
-    VALUES (gerar_proximo_codigo_aplicacao(), NEW.codigo, 'Genérico/Diversos')
-    ON CONFLICT DO NOTHING;
-    RETURN NEW;
-END; $$;
-
-
---
--- Name: trg_criar_subconjunto_generico(); Type: FUNCTION; Schema: public; Owner: -
---
-
-CREATE FUNCTION public.trg_criar_subconjunto_generico() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-BEGIN
-    IF NEW.codigo = 0 THEN RETURN NEW; END IF;
-    INSERT INTO subconjuntos (codigo, cod_classificacao_macro, nome)
-    VALUES (gerar_proximo_codigo_subconjunto(), NEW.codigo, 'Genérico/Diversos')
-    ON CONFLICT DO NOTHING;
-    RETURN NEW;
-END; $$;
 
 
 --
@@ -2099,13 +2039,13 @@ $$;
 --
 
 CREATE FUNCTION storage.filename(name text) RETURNS text
-    LANGUAGE plpgsql
+    LANGUAGE plpgsql IMMUTABLE
     AS $$
 DECLARE
-_parts text[];
+    _parts text[];
 BEGIN
-	select string_to_array(name, '/') into _parts;
-	return _parts[array_length(_parts,1)];
+    SELECT string_to_array(name, '/') INTO _parts;
+    RETURN _parts[array_length(_parts, 1)];
 END
 $$;
 
@@ -3539,19 +3479,6 @@ CREATE TABLE auth.webauthn_credentials (
 
 
 --
--- Name: aplicacoes; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.aplicacoes (
-    codigo integer NOT NULL,
-    cod_subconjunto integer NOT NULL,
-    nome text NOT NULL,
-    ativo boolean DEFAULT true NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
-);
-
-
---
 -- Name: categorias; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -3569,18 +3496,6 @@ CREATE TABLE public.centros_distribuicao (
     codigo text NOT NULL,
     nome text NOT NULL,
     estado text NOT NULL
-);
-
-
---
--- Name: classificacoes_macro; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.classificacoes_macro (
-    codigo integer NOT NULL,
-    nome text NOT NULL,
-    ativo boolean DEFAULT true NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
@@ -3851,7 +3766,7 @@ CREATE TABLE public.materiais (
     indicador double precision DEFAULT 0,
     estoque_maximo double precision DEFAULT 0,
     classificacao text DEFAULT 'D'::text,
-    cod_aplicacao integer
+    cod_subconjunto integer
 );
 
 
@@ -4162,7 +4077,7 @@ ALTER SEQUENCE public.solicitacoes_correcao_entrada_id_seq OWNED BY public.solic
 
 CREATE TABLE public.subconjuntos (
     codigo integer NOT NULL,
-    cod_classificacao_macro integer NOT NULL,
+    cod_categoria integer NOT NULL,
     nome text NOT NULL,
     ativo boolean DEFAULT true NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL
@@ -4810,14 +4725,6 @@ ALTER TABLE ONLY auth.webauthn_credentials
 
 
 --
--- Name: aplicacoes aplicacoes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.aplicacoes
-    ADD CONSTRAINT aplicacoes_pkey PRIMARY KEY (codigo);
-
-
---
 -- Name: categorias categorias_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -4831,14 +4738,6 @@ ALTER TABLE ONLY public.categorias
 
 ALTER TABLE ONLY public.centros_distribuicao
     ADD CONSTRAINT centros_distribuicao_pkey PRIMARY KEY (codigo);
-
-
---
--- Name: classificacoes_macro classificacoes_macro_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.classificacoes_macro
-    ADD CONSTRAINT classificacoes_macro_pkey PRIMARY KEY (codigo);
 
 
 --
@@ -5514,13 +5413,6 @@ CREATE INDEX webauthn_credentials_user_id_idx ON auth.webauthn_credentials USING
 
 
 --
--- Name: idx_aplicacoes_subconjunto; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_aplicacoes_subconjunto ON public.aplicacoes USING btree (cod_subconjunto);
-
-
---
 -- Name: idx_correcao_entrada_documento; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5626,10 +5518,10 @@ CREATE INDEX idx_materiais_categoria ON public.materiais USING btree (categoria)
 
 
 --
--- Name: idx_materiais_cod_aplicacao; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_materiais_cod_subconjunto; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_materiais_cod_aplicacao ON public.materiais USING btree (cod_aplicacao);
+CREATE INDEX idx_materiais_cod_subconjunto ON public.materiais USING btree (cod_subconjunto);
 
 
 --
@@ -5675,31 +5567,17 @@ CREATE INDEX idx_solicitacoes_compra_numero ON public.solicitacoes_compra USING 
 
 
 --
--- Name: idx_subconjuntos_macro; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_subconjuntos_categoria; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_subconjuntos_macro ON public.subconjuntos USING btree (cod_classificacao_macro);
-
-
---
--- Name: uq_aplicacoes_nome_subconjunto; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE UNIQUE INDEX uq_aplicacoes_nome_subconjunto ON public.aplicacoes USING btree (cod_subconjunto, upper(nome));
+CREATE INDEX idx_subconjuntos_categoria ON public.subconjuntos USING btree (cod_categoria);
 
 
 --
--- Name: uq_classificacoes_macro_nome; Type: INDEX; Schema: public; Owner: -
+-- Name: uq_subconjuntos_nome_categoria; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX uq_classificacoes_macro_nome ON public.classificacoes_macro USING btree (upper(nome));
-
-
---
--- Name: uq_subconjuntos_nome_macro; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE UNIQUE INDEX uq_subconjuntos_nome_macro ON public.subconjuntos USING btree (cod_classificacao_macro, upper(nome));
+CREATE UNIQUE INDEX uq_subconjuntos_nome_categoria ON public.subconjuntos USING btree (cod_categoria, upper(nome));
 
 
 --
@@ -5777,20 +5655,6 @@ CREATE INDEX name_prefix_search ON storage.objects USING btree (name text_patter
 --
 
 CREATE UNIQUE INDEX vector_indexes_name_bucket_id_idx ON storage.vector_indexes USING btree (name, bucket_id);
-
-
---
--- Name: classificacoes_macro trg_after_insert_classificacao_macro; Type: TRIGGER; Schema: public; Owner: -
---
-
-CREATE TRIGGER trg_after_insert_classificacao_macro AFTER INSERT ON public.classificacoes_macro FOR EACH ROW EXECUTE FUNCTION public.trg_criar_subconjunto_generico();
-
-
---
--- Name: subconjuntos trg_after_insert_subconjunto; Type: TRIGGER; Schema: public; Owner: -
---
-
-CREATE TRIGGER trg_after_insert_subconjunto AFTER INSERT ON public.subconjuntos FOR EACH ROW EXECUTE FUNCTION public.trg_criar_aplicacao_generica();
 
 
 --
@@ -5973,27 +5837,19 @@ ALTER TABLE ONLY auth.webauthn_credentials
 
 
 --
--- Name: aplicacoes aplicacoes_cod_subconjunto_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.aplicacoes
-    ADD CONSTRAINT aplicacoes_cod_subconjunto_fkey FOREIGN KEY (cod_subconjunto) REFERENCES public.subconjuntos(codigo);
-
-
---
--- Name: materiais materiais_cod_aplicacao_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: materiais materiais_cod_subconjunto_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.materiais
-    ADD CONSTRAINT materiais_cod_aplicacao_fkey FOREIGN KEY (cod_aplicacao) REFERENCES public.aplicacoes(codigo);
+    ADD CONSTRAINT materiais_cod_subconjunto_fkey FOREIGN KEY (cod_subconjunto) REFERENCES public.subconjuntos(codigo);
 
 
 --
--- Name: subconjuntos subconjuntos_cod_classificacao_macro_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: subconjuntos subconjuntos_cod_categoria_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.subconjuntos
-    ADD CONSTRAINT subconjuntos_cod_classificacao_macro_fkey FOREIGN KEY (cod_classificacao_macro) REFERENCES public.classificacoes_macro(codigo);
+    ADD CONSTRAINT subconjuntos_cod_categoria_fkey FOREIGN KEY (cod_categoria) REFERENCES public.categorias(codigo);
 
 
 --
@@ -6149,18 +6005,6 @@ ALTER TABLE auth.sso_providers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE auth.users ENABLE ROW LEVEL SECURITY;
 
 --
--- Name: aplicacoes; Type: ROW SECURITY; Schema: public; Owner: -
---
-
-ALTER TABLE public.aplicacoes ENABLE ROW LEVEL SECURITY;
-
---
--- Name: classificacoes_macro; Type: ROW SECURITY; Schema: public; Owner: -
---
-
-ALTER TABLE public.classificacoes_macro ENABLE ROW LEVEL SECURITY;
-
---
 -- Name: subconjuntos; Type: ROW SECURITY; Schema: public; Owner: -
 --
 
@@ -6283,5 +6127,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict XEdR19le2ztpRoiOcXlRE9qKBJ0gKAsbxmmDEy7K2j8LyIDpPg5kmxYuy3dxidF
+\unrestrict 9IvySju2gZnl5KKLaenkv6qxWp8bitOot26TK6dlP1TMXrrtgitu4MPxBjmzQej
 
