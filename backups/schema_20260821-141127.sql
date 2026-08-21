@@ -2,10 +2,10 @@
 -- PostgreSQL database dump
 --
 
-\restrict 4quhIAUCrVAIosp3thI0UebT7Z7sxHFMWrVaTE52rWzmLdk2MhB2ILdUOLbFJsG
+\restrict eiNWZ97jBgyQUJf3BLUCxIQlqMqo5BGRu3wbp8oyLHGXWW1a4QXpiL25HUO6Cly
 
 -- Dumped from database version 17.6
--- Dumped by pg_dump version 17.10 (Ubuntu 17.10-1.pgdg24.04+1)
+-- Dumped by pg_dump version 17.11 (Ubuntu 17.11-1.pgdg24.04+2)
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -4267,7 +4267,11 @@ CREATE TABLE storage.buckets (
     file_size_limit bigint,
     allowed_mime_types text[],
     owner_id text,
-    type storage.buckettype DEFAULT 'STANDARD'::storage.buckettype NOT NULL
+    type storage.buckettype DEFAULT 'STANDARD'::storage.buckettype NOT NULL,
+    versioning_status text DEFAULT 'DISABLED'::text NOT NULL,
+    CONSTRAINT buckets_versioning_dark_check CHECK ((versioning_status = 'DISABLED'::text)),
+    CONSTRAINT buckets_versioning_standard_only_check CHECK (((type = 'STANDARD'::storage.buckettype) OR (versioning_status = 'DISABLED'::text))),
+    CONSTRAINT buckets_versioning_status_check CHECK ((versioning_status = ANY (ARRAY['DISABLED'::text, 'ENABLED'::text, 'SUSPENDED'::text])))
 );
 
 
@@ -4333,7 +4337,10 @@ CREATE TABLE storage.objects (
     path_tokens text[] GENERATED ALWAYS AS (string_to_array(name, '/'::text)) STORED,
     version text,
     owner_id text,
-    user_metadata jsonb
+    user_metadata jsonb,
+    archived_at timestamp with time zone,
+    is_delete_marker boolean DEFAULT false NOT NULL,
+    is_versioned boolean DEFAULT false NOT NULL
 );
 
 
@@ -6127,5 +6134,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 4quhIAUCrVAIosp3thI0UebT7Z7sxHFMWrVaTE52rWzmLdk2MhB2ILdUOLbFJsG
+\unrestrict eiNWZ97jBgyQUJf3BLUCxIQlqMqo5BGRu3wbp8oyLHGXWW1a4QXpiL25HUO6Cly
 
