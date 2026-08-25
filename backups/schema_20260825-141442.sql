@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict IDfaIM004MrEHPIDKOfYgwg7PzlxmGnKMltnJ9C7AFMZ2NMM55zXgTxaOtGHaRR
+\restrict hmGwIxCpnD8q1o3YqdYnimMl4hnyM0KyxcfDb1kwP2EQc29icY0YsFW6xcyyIad
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.11 (Ubuntu 17.11-1.pgdg24.04+2)
@@ -442,55 +442,46 @@ COMMENT ON FUNCTION extensions.grant_pg_cron_access() IS 'Grants access to pg_cr
 
 CREATE FUNCTION extensions.grant_pg_graphql_access() RETURNS event_trigger
     LANGUAGE plpgsql
+    SET search_path TO ''
     AS $_$
-DECLARE
-    func_is_graphql_resolve bool;
-BEGIN
-    func_is_graphql_resolve = (
-        SELECT n.proname = 'resolve'
-        FROM pg_event_trigger_ddl_commands() AS ev
-        LEFT JOIN pg_catalog.pg_proc AS n
-        ON ev.objid = n.oid
-    );
+begin
+    if not exists (
+        select 1
+        from pg_catalog.pg_event_trigger_ddl_commands() ev
+        join pg_catalog.pg_extension e on ev.objid = e.oid
+        where e.extname = 'pg_graphql'
+    ) then
+        return;
+    end if;
 
-    IF func_is_graphql_resolve
-    THEN
-        -- Update public wrapper to pass all arguments through to the pg_graphql resolve func
-        DROP FUNCTION IF EXISTS graphql_public.graphql;
-        create or replace function graphql_public.graphql(
-            "operationName" text default null,
-            query text default null,
-            variables jsonb default null,
-            extensions jsonb default null
-        )
-            returns jsonb
-            language sql
-        as $$
-            select graphql.resolve(
-                query := query,
-                variables := coalesce(variables, '{}'),
-                "operationName" := "operationName",
-                extensions := extensions
-            );
-        $$;
+    drop function if exists graphql_public.graphql;
+    create or replace function graphql_public.graphql(
+        "operationName" text default null,
+        query text default null,
+        variables jsonb default null,
+        extensions jsonb default null
+    )
+        returns jsonb
+        language sql
+        set search_path to ''
+    as $$
+        select graphql.resolve(
+            query := query,
+            variables := coalesce(variables, '{}'),
+            "operationName" := "operationName",
+            extensions := extensions
+        );
+    $$;
 
-        -- This hook executes when `graphql.resolve` is created. That is not necessarily the last
-        -- function in the extension so we need to grant permissions on existing entities AND
-        -- update default permissions to any others that are created after `graphql.resolve`
-        grant usage on schema graphql to postgres, anon, authenticated, service_role;
-        grant select on all tables in schema graphql to postgres, anon, authenticated, service_role;
-        grant execute on all functions in schema graphql to postgres, anon, authenticated, service_role;
-        grant all on all sequences in schema graphql to postgres, anon, authenticated, service_role;
-        alter default privileges in schema graphql grant all on tables to postgres, anon, authenticated, service_role;
-        alter default privileges in schema graphql grant all on functions to postgres, anon, authenticated, service_role;
-        alter default privileges in schema graphql grant all on sequences to postgres, anon, authenticated, service_role;
+    -- Attach the wrapper to the extension so DROP EXTENSION cascades to it,
+    -- which in turn triggers set_graphql_placeholder to reinstall the "not enabled" stub.
+    alter extension pg_graphql add function graphql_public.graphql(text, text, jsonb, jsonb);
 
-        -- Allow postgres role to allow granting usage on graphql and graphql_public schemas to custom roles
-        grant usage on schema graphql_public to postgres with grant option;
-        grant usage on schema graphql to postgres with grant option;
-    END IF;
-
-END;
+    grant usage on schema graphql to postgres, anon, authenticated, service_role;
+    grant execute on function graphql.resolve to postgres, anon, authenticated, service_role;
+    grant usage on schema graphql to postgres with grant option;
+    grant usage on schema graphql_public to postgres with grant option;
+end;
 $_$;
 
 
@@ -2409,6 +2400,9 @@ DECLARE
     v_limit INT;
     v_prefix TEXT;
     v_prefix_lower TEXT;
+    v_prefix_len INT;
+    v_prefix_start INT;
+    v_combined_levels INT;
     v_is_asc BOOLEAN;
     v_order_by TEXT;
     v_sort_order TEXT;
@@ -2429,6 +2423,9 @@ BEGIN
     v_limit := LEAST(coalesce(limits, 100), 1500);
     v_prefix := coalesce(prefix, '') || coalesce(search, '');
     v_prefix_lower := lower(v_prefix);
+    v_prefix_len := length(coalesce(prefix, ''));
+    v_prefix_start := coalesce(array_length(string_to_array(coalesce(prefix, ''), v_delimiter), 1), 1);
+    v_combined_levels := coalesce(array_length(string_to_array(v_prefix, v_delimiter), 1), 1);
     v_is_asc := lower(coalesce(sortorder, 'asc')) = 'asc';
     v_file_batch_size := LEAST(GREATEST(v_limit * 2, 100), 1000);
 
@@ -2444,17 +2441,17 @@ BEGIN
     v_sort_order := CASE WHEN v_is_asc THEN 'asc' ELSE 'desc' END;
 
     -- ========================================================================
-    -- NON-NAME SORTING: Use path_tokens approach (unchanged)
+    -- NON-NAME SORTING: Use path_tokens approach
     -- ========================================================================
     IF v_order_by != 'name' THEN
         RETURN QUERY EXECUTE format(
             $sql$
             WITH folders AS (
-                SELECT path_tokens[$1] AS folder
+                SELECT array_to_string(path_tokens[$1:$2], '/') AS folder
                 FROM storage.objects
-                WHERE objects.name ILIKE $2 || '%%'
-                  AND bucket_id = $3
-                  AND array_length(objects.path_tokens, 1) <> $1
+                WHERE objects.name ILIKE $3 || '%%'
+                  AND bucket_id = $4
+                  AND array_length(objects.path_tokens, 1) <> $2
                 GROUP BY folder
                 ORDER BY folder %s
             )
@@ -2465,16 +2462,16 @@ BEGIN
                    NULL::timestamptz AS last_accessed_at,
                    NULL::jsonb AS metadata FROM folders)
             UNION ALL
-            (SELECT path_tokens[$1] AS "name",
+            (SELECT array_to_string(path_tokens[$1:$2], '/') AS "name",
                    id, updated_at, created_at, last_accessed_at, metadata
              FROM storage.objects
-             WHERE objects.name ILIKE $2 || '%%'
-               AND bucket_id = $3
-               AND array_length(objects.path_tokens, 1) = $1
+             WHERE objects.name ILIKE $3 || '%%'
+               AND bucket_id = $4
+               AND array_length(objects.path_tokens, 1) = $2
              ORDER BY %I %s)
-            LIMIT $4 OFFSET $5
+            LIMIT $5 OFFSET $6
             $sql$, v_sort_order, v_order_by, v_sort_order
-        ) USING levels, v_prefix, bucketname, v_limit, offsets;
+        ) USING v_prefix_start, v_combined_levels, v_prefix, bucketname, v_limit, offsets;
         RETURN;
     END IF;
 
@@ -2584,7 +2581,7 @@ BEGIN
             IF v_skipped < offsets THEN
                 v_skipped := v_skipped + 1;
             ELSE
-                name := split_part(rtrim(storage.get_common_prefix(v_peek_name, v_prefix, v_delimiter), v_delimiter), v_delimiter, levels);
+                name := substring(rtrim(storage.get_common_prefix(v_peek_name, v_prefix, v_delimiter), v_delimiter) from v_prefix_len + 1);
                 id := NULL;
                 updated_at := NULL;
                 created_at := NULL;
@@ -2621,7 +2618,7 @@ BEGIN
                     v_skipped := v_skipped + 1;
                 ELSE
                     -- Emit file
-                    name := split_part(v_current.name, v_delimiter, levels);
+                    name := substring(v_current.name from v_prefix_len + 1);
                     id := v_current.id;
                     updated_at := v_current.updated_at;
                     created_at := v_current.created_at;
@@ -2657,10 +2654,26 @@ DECLARE
     v_cursor_op text;
     v_query text;
     v_prefix text;
+    v_sort_order text;
+    v_sort_column text;
 BEGIN
     v_prefix := coalesce(p_prefix, '');
 
-    IF p_sort_order = 'asc' THEN
+    -- Defense-in-depth: this function is independently reachable and must
+    -- not trust p_sort_order/p_sort_column to already be validated by a
+    -- caller. Normalize to the same strict allow-list storage.search_v2
+    -- uses before interpolating anything into dynamic SQL below.
+    v_sort_order := lower(coalesce(p_sort_order, 'asc'));
+    IF v_sort_order NOT IN ('asc', 'desc') THEN
+        v_sort_order := 'asc';
+    END IF;
+
+    v_sort_column := lower(coalesce(p_sort_column, 'updated_at'));
+    IF v_sort_column NOT IN ('updated_at', 'created_at') THEN
+        v_sort_column := 'updated_at';
+    END IF;
+
+    IF v_sort_order = 'asc' THEN
         v_cursor_op := '>';
     ELSE
         v_cursor_op := '<';
@@ -2740,11 +2753,11 @@ BEGIN
             name COLLATE "C" %s
         LIMIT $4
     $sql$,
-        p_sort_column,
+        v_sort_column,
         v_cursor_op,
-        p_sort_column,
-        p_sort_order,
-        p_sort_order
+        v_sort_column,
+        v_sort_order,
+        v_sort_order
     );
 
     RETURN QUERY EXECUTE v_query
@@ -4267,7 +4280,11 @@ CREATE TABLE storage.buckets (
     file_size_limit bigint,
     allowed_mime_types text[],
     owner_id text,
-    type storage.buckettype DEFAULT 'STANDARD'::storage.buckettype NOT NULL
+    type storage.buckettype DEFAULT 'STANDARD'::storage.buckettype NOT NULL,
+    versioning_status text DEFAULT 'DISABLED'::text NOT NULL,
+    CONSTRAINT buckets_versioning_dark_check CHECK ((versioning_status = 'DISABLED'::text)),
+    CONSTRAINT buckets_versioning_standard_only_check CHECK (((type = 'STANDARD'::storage.buckettype) OR (versioning_status = 'DISABLED'::text))),
+    CONSTRAINT buckets_versioning_status_check CHECK ((versioning_status = ANY (ARRAY['DISABLED'::text, 'ENABLED'::text, 'SUSPENDED'::text])))
 );
 
 
@@ -4333,7 +4350,10 @@ CREATE TABLE storage.objects (
     path_tokens text[] GENERATED ALWAYS AS (string_to_array(name, '/'::text)) STORED,
     version text,
     owner_id text,
-    user_metadata jsonb
+    user_metadata jsonb,
+    archived_at timestamp with time zone,
+    is_delete_marker boolean DEFAULT false NOT NULL,
+    is_versioned boolean DEFAULT false NOT NULL
 );
 
 
@@ -6127,5 +6147,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict IDfaIM004MrEHPIDKOfYgwg7PzlxmGnKMltnJ9C7AFMZ2NMM55zXgTxaOtGHaRR
+\unrestrict hmGwIxCpnD8q1o3YqdYnimMl4hnyM0KyxcfDb1kwP2EQc29icY0YsFW6xcyyIad
 
