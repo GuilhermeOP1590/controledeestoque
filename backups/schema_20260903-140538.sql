@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict hmGwIxCpnD8q1o3YqdYnimMl4hnyM0KyxcfDb1kwP2EQc29icY0YsFW6xcyyIad
+\restrict 8XNESfrGD5VylfEM3s5jjaI8ibJY4J5dL9Fltz3rYD1g9ttjAIbb6aTV8cBt9YT
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.11 (Ubuntu 17.11-1.pgdg24.04+2)
@@ -398,6 +398,7 @@ COMMENT ON FUNCTION auth.uid() IS 'Deprecated. Use auth.jwt() -> ''sub'' instead
 
 CREATE FUNCTION extensions.grant_pg_cron_access() RETURNS event_trigger
     LANGUAGE plpgsql
+    SET search_path TO ''
     AS $$
 BEGIN
   IF EXISTS (
@@ -424,6 +425,7 @@ BEGIN
     grant all privileges on all tables in schema cron to postgres with grant option;
     revoke all on table cron.job from postgres;
     grant select on table cron.job to postgres with grant option;
+    revoke trigger on cron.job_run_details from postgres;
   END IF;
 END;
 $$;
@@ -498,6 +500,7 @@ COMMENT ON FUNCTION extensions.grant_pg_graphql_access() IS 'Grants access to pg
 
 CREATE FUNCTION extensions.grant_pg_net_access() RETURNS event_trigger
     LANGUAGE plpgsql
+    SET search_path TO ''
     AS $$
 BEGIN
   IF EXISTS (
@@ -524,7 +527,7 @@ BEGIN
       WHERE extname = 'pg_net'
       -- all versions in use on existing projects as of 2025-02-20
       -- version 0.12.0 onwards don't need these applied
-      AND extversion IN ('0.2', '0.6', '0.7', '0.7.1', '0.8', '0.10.0', '0.11.0')
+      AND extversion IN ('0.2', '0.6', '0.7', '0.7.1', '0.8.0', '0.10.0', '0.11.0')
     ) THEN
       ALTER function net.http_get(url text, params jsonb, headers jsonb, timeout_milliseconds integer) SECURITY DEFINER;
       ALTER function net.http_post(url text, body jsonb, params jsonb, headers jsonb, timeout_milliseconds integer) SECURITY DEFINER;
@@ -556,6 +559,7 @@ COMMENT ON FUNCTION extensions.grant_pg_net_access() IS 'Grants access to pg_net
 
 CREATE FUNCTION extensions.pgrst_ddl_watch() RETURNS event_trigger
     LANGUAGE plpgsql
+    SET search_path TO ''
     AS $$
 DECLARE
   cmd record;
@@ -589,6 +593,7 @@ END; $$;
 
 CREATE FUNCTION extensions.pgrst_drop_watch() RETURNS event_trigger
     LANGUAGE plpgsql
+    SET search_path TO ''
     AS $$
 DECLARE
   obj record;
@@ -620,6 +625,7 @@ END; $$;
 
 CREATE FUNCTION extensions.set_graphql_placeholder() RETURNS event_trigger
     LANGUAGE plpgsql
+    SET search_path TO ''
     AS $_$
     DECLARE
     graphql_is_dropped bool;
@@ -640,6 +646,7 @@ CREATE FUNCTION extensions.set_graphql_placeholder() RETURNS event_trigger
         )
             returns jsonb
             language plpgsql
+            set search_path to ''
         as $$
             DECLARE
                 server_version float;
@@ -6147,5 +6154,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict hmGwIxCpnD8q1o3YqdYnimMl4hnyM0KyxcfDb1kwP2EQc29icY0YsFW6xcyyIad
+\unrestrict 8XNESfrGD5VylfEM3s5jjaI8ibJY4J5dL9Fltz3rYD1g9ttjAIbb6aTV8cBt9YT
 
