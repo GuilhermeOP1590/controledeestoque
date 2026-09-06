@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict csOMuRVX6XxLJXyT293nxCAaIv6DxBAXiMfsAheZUGYJLjZAPWZhHSCxBv7FFkz
+\restrict VK37cXeVxwfWXkYdytZrV6lWNUauCrWoKUFs8C8Tj1b5Kg5lhVR0vgIRBLEOdH4
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.11 (Ubuntu 17.11-1.pgdg24.04+2)
@@ -465,7 +465,6 @@ begin
     )
         returns jsonb
         language sql
-        set search_path to ''
     as $$
         select graphql.resolve(
             query := query,
@@ -6154,5 +6153,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict csOMuRVX6XxLJXyT293nxCAaIv6DxBAXiMfsAheZUGYJLjZAPWZhHSCxBv7FFkz
+\unrestrict VK37cXeVxwfWXkYdytZrV6lWNUauCrWoKUFs8C8Tj1b5Kg5lhVR0vgIRBLEOdH4
 
