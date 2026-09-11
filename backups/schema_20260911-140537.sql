@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict YdJRV7hhxN6IpPUOKjzsabABCskAYpplhJWa1wdUUTEsPMJIGBNHHw2lC6jOd0A
+\restrict v3A97SKVxhu4y023skCQbFrdLs3z0Ha8SLd5SkK5NJvB2RuNu6E9TuO0IKGewq1
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.11 (Ubuntu 17.11-1.pgdg24.04+2)
@@ -465,7 +465,6 @@ begin
     )
         returns jsonb
         language sql
-        set search_path to ''
     as $$
         select graphql.resolve(
             query := query,
@@ -5671,10 +5670,31 @@ CREATE INDEX idx_objects_bucket_id_name_lower ON storage.objects USING btree (bu
 
 
 --
+-- Name: idx_objects_current_version; Type: INDEX; Schema: storage; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_objects_current_version ON storage.objects USING btree (bucket_id, name COLLATE "C") WHERE (archived_at IS NULL);
+
+
+--
+-- Name: idx_objects_null_version; Type: INDEX; Schema: storage; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_objects_null_version ON storage.objects USING btree (bucket_id, name COLLATE "C") WHERE (NOT is_versioned);
+
+
+--
 -- Name: name_prefix_search; Type: INDEX; Schema: storage; Owner: -
 --
 
 CREATE INDEX name_prefix_search ON storage.objects USING btree (name text_pattern_ops);
+
+
+--
+-- Name: objects_bucket_id_name_version_key; Type: INDEX; Schema: storage; Owner: -
+--
+
+CREATE UNIQUE INDEX objects_bucket_id_name_version_key ON storage.objects USING btree (bucket_id, name COLLATE "C", version) NULLS NOT DISTINCT;
 
 
 --
@@ -6154,5 +6174,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict YdJRV7hhxN6IpPUOKjzsabABCskAYpplhJWa1wdUUTEsPMJIGBNHHw2lC6jOd0A
+\unrestrict v3A97SKVxhu4y023skCQbFrdLs3z0Ha8SLd5SkK5NJvB2RuNu6E9TuO0IKGewq1
 
