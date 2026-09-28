@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 0XgNukPUesBEgUSr8bSZ66baABTnkULKiB6adoCqir8sQNinGrtUfxBn7TtYuYv
+\restrict YSSuawKfMIqSzDKdFg4ljLI5NHVfXYbI7Tn8INiImLbCOSyJNY71UXYDRsaNbN8
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.11 (Ubuntu 17.11-1.pgdg24.04+2)
@@ -1008,6 +1008,91 @@ $$;
 
 
 --
+-- Name: registrar_saida_atomica(jsonb, text, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.registrar_saida_atomica(p_registros jsonb, p_numero text, p_cod_cd text) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    rec JSONB;
+    v_cod_material TEXT;
+    v_quantidade NUMERIC;
+    v_estoque_cd NUMERIC;
+BEGIN
+    -- 1. Validar saldo em cada CD (com lock para evitar race condition)
+    FOR rec IN SELECT * FROM jsonb_array_elements(p_registros) LOOP
+        v_cod_material := rec->>'cod_material';
+        v_quantidade   := (rec->>'quantidade')::NUMERIC;
+
+        SELECT COALESCE(estoque, 0) INTO v_estoque_cd
+        FROM estoque_cd
+        WHERE cod_material = v_cod_material AND cod_cd = p_cod_cd
+        FOR UPDATE;
+
+        IF COALESCE(v_estoque_cd, 0) < v_quantidade THEN
+            RAISE EXCEPTION 'Estoque insuficiente no CD % para o material %. Disponível: %, Solicitado: %',
+                p_cod_cd, v_cod_material, COALESCE(v_estoque_cd, 0), v_quantidade;
+        END IF;
+    END LOOP;
+
+    -- 2. Inserir registros de saída (agora com dados do chamado)
+    INSERT INTO saidas (
+        numero, data, solicitante, cod_filial, filial,
+        item, cod_material, descricao, cod_unidade, unidade,
+        quantidade, atividade, registrado_por, cod_cd,
+        numero_chamado, assunto_chamado, descricao_chamado, motivo_sem_chamado
+    )
+    SELECT
+        p_numero,
+        (rec->>'data')::DATE,
+        rec->>'solicitante',
+        (rec->>'cod_filial')::INT,
+        rec->>'filial',
+        (rec->>'item')::INT,
+        rec->>'cod_material',
+        rec->>'descricao',
+        rec->>'cod_unidade',
+        rec->>'unidade',
+        (rec->>'quantidade')::NUMERIC,
+        rec->>'atividade',
+        rec->>'registrado_por',
+        p_cod_cd,
+        rec->>'numero_chamado',
+        rec->>'assunto_chamado',
+        rec->>'descricao_chamado',
+        rec->>'motivo_sem_chamado'
+    FROM jsonb_array_elements(p_registros) AS rec;
+
+    -- 3. Decrementar estoque global
+    UPDATE materiais m
+    SET
+        estoque = m.estoque - totais.soma,
+        indicador = CASE
+            WHEN m.estoque_minimo > 0 THEN ROUND((m.estoque - totais.soma) / m.estoque_minimo, 2)
+            ELSE 0
+        END
+    FROM (
+        SELECT rec->>'cod_material' AS codigo, SUM((rec->>'quantidade')::NUMERIC) AS soma
+        FROM jsonb_array_elements(p_registros) AS rec
+        GROUP BY rec->>'cod_material'
+    ) AS totais
+    WHERE m.codigo = totais.codigo;
+
+    -- 4. Decrementar estoque por CD
+    UPDATE estoque_cd
+    SET estoque = estoque_cd.estoque - totais.soma
+    FROM (
+        SELECT rec->>'cod_material' AS codigo, SUM((rec->>'quantidade')::NUMERIC) AS soma
+        FROM jsonb_array_elements(p_registros) AS rec
+        GROUP BY rec->>'cod_material'
+    ) AS totais
+    WHERE estoque_cd.cod_material = totais.codigo AND estoque_cd.cod_cd = p_cod_cd;
+END;
+$$;
+
+
+--
 -- Name: resetar_sequencias(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -1875,10 +1960,19 @@ begin
         '{}'
     ) from unnest(new.filters) f;
 
-    new.selected_columns = (
-        select array_agg(c order by c)
-        from unnest(new.selected_columns) c
-    );
+    -- Normalize selected_columns order so ARRAY['a','b'] and ARRAY['b','a'] are treated
+    -- as the same subscription group in apply_rls. Preserve an empty array as '{}'
+    -- ("primary keys only") so it stays distinct from NULL ("all columns"); array_agg
+    -- over an empty set would otherwise collapse '{}' back to NULL.
+    if new.selected_columns is not null then
+        new.selected_columns = coalesce(
+            (
+                select array_agg(c order by c)
+                from unnest(new.selected_columns) c
+            ),
+            '{}'::text[]
+        );
+    end if;
 
     return new;
 end;
@@ -4482,6 +4576,25 @@ CREATE TABLE public.centros_distribuicao (
 
 
 --
+-- Name: emprestimos_ferramenta; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.emprestimos_ferramenta (
+    numero text NOT NULL,
+    cod_ferramenta text NOT NULL,
+    descricao_ferramenta text,
+    tipo_controle text NOT NULL,
+    quantidade double precision DEFAULT 1 NOT NULL,
+    tecnico text NOT NULL,
+    data_emprestimo timestamp with time zone DEFAULT now() NOT NULL,
+    data_prevista_devolucao date,
+    data_devolucao_real timestamp with time zone,
+    registrado_por text,
+    observacao text
+);
+
+
+--
 -- Name: entradas; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -4540,6 +4653,22 @@ CREATE TABLE public.estoque_cd (
     estoque double precision DEFAULT 0 NOT NULL,
     estoque_minimo double precision DEFAULT 0 NOT NULL,
     estoque_maximo double precision DEFAULT 0 NOT NULL
+);
+
+
+--
+-- Name: ferramentas; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.ferramentas (
+    codigo text NOT NULL,
+    descricao text NOT NULL,
+    tipo_controle text NOT NULL,
+    estoque double precision DEFAULT 0 NOT NULL,
+    ativo boolean DEFAULT true NOT NULL,
+    cod_tipo text,
+    tipo text,
+    CONSTRAINT ferramentas_tipo_controle_check CHECK ((tipo_controle = ANY (ARRAY['INVENTARIO_TECNICO'::text, 'ESTOQUE'::text])))
 );
 
 
@@ -4636,12 +4765,63 @@ ALTER SEQUENCE public.historico_status_compra_id_seq OWNED BY public.historico_s
 
 
 --
+-- Name: historico_status_separacao; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.historico_status_separacao (
+    id bigint NOT NULL,
+    numero text NOT NULL,
+    status_anterior text,
+    status_novo text,
+    usuario text,
+    data_hora timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: historico_status_separacao_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.historico_status_separacao_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: historico_status_separacao_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.historico_status_separacao_id_seq OWNED BY public.historico_status_separacao.id;
+
+
+--
+-- Name: itens_solicitacao_separacao; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.itens_solicitacao_separacao (
+    numero text NOT NULL,
+    item integer NOT NULL,
+    cod_material text NOT NULL,
+    descricao text,
+    cod_unidade text,
+    unidade text,
+    quantidade_solicitada double precision NOT NULL,
+    quantidade_separada double precision DEFAULT 0 NOT NULL
+);
+
+
+--
 -- Name: localizacoes; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.localizacoes (
     codigo text NOT NULL,
-    descricao text NOT NULL
+    descricao text NOT NULL,
+    lado character(1),
+    CONSTRAINT localizacoes_lado_check CHECK (((lado IS NULL) OR (lado = ANY (ARRAY['E'::bpchar, 'D'::bpchar]))))
 );
 
 
@@ -4791,7 +4971,11 @@ CREATE TABLE public.saidas (
     quantidade double precision NOT NULL,
     atividade text,
     registrado_por text DEFAULT ''::text,
-    cod_cd text DEFAULT 'MG'::text
+    cod_cd text DEFAULT 'MG'::text,
+    numero_chamado text,
+    assunto_chamado text,
+    descricao_chamado text,
+    motivo_sem_chamado text
 );
 
 
@@ -5054,6 +5238,29 @@ ALTER SEQUENCE public.solicitacoes_correcao_entrada_id_seq OWNED BY public.solic
 
 
 --
+-- Name: solicitacoes_separacao; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.solicitacoes_separacao (
+    numero text NOT NULL,
+    data_solicitacao timestamp with time zone DEFAULT now() NOT NULL,
+    solicitante text NOT NULL,
+    cod_filial integer NOT NULL,
+    filial text NOT NULL,
+    cod_cd text NOT NULL,
+    atividade text,
+    status text DEFAULT 'PENDENTE'::text NOT NULL,
+    responsavel text,
+    observacao text,
+    numero_saida_gerado text,
+    atualizado_em timestamp with time zone DEFAULT now() NOT NULL,
+    numero_chamado text,
+    assunto_chamado text,
+    descricao_chamado text
+);
+
+
+--
 -- Name: subconjuntos; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -5063,6 +5270,16 @@ CREATE TABLE public.subconjuntos (
     nome text NOT NULL,
     ativo boolean DEFAULT true NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: tipos_ferramenta; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tipos_ferramenta (
+    codigo text NOT NULL,
+    nome text NOT NULL
 );
 
 
@@ -5187,7 +5404,8 @@ CREATE TABLE realtime.messages (
     updated_at timestamp without time zone DEFAULT now() NOT NULL,
     inserted_at timestamp without time zone DEFAULT now() NOT NULL,
     id uuid DEFAULT gen_random_uuid() NOT NULL,
-    binary_payload bytea
+    binary_payload bytea,
+    skip_broadcast boolean DEFAULT false NOT NULL
 )
 PARTITION BY RANGE (inserted_at);
 
@@ -5421,6 +5639,13 @@ ALTER TABLE ONLY public.historico_acessos ALTER COLUMN id SET DEFAULT nextval('p
 --
 
 ALTER TABLE ONLY public.historico_status_compra ALTER COLUMN id SET DEFAULT nextval('public.historico_status_compra_id_seq'::regclass);
+
+
+--
+-- Name: historico_status_separacao id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.historico_status_separacao ALTER COLUMN id SET DEFAULT nextval('public.historico_status_separacao_id_seq'::regclass);
 
 
 --
@@ -5787,6 +6012,14 @@ ALTER TABLE ONLY public.centros_distribuicao
 
 
 --
+-- Name: emprestimos_ferramenta emprestimos_ferramenta_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.emprestimos_ferramenta
+    ADD CONSTRAINT emprestimos_ferramenta_pkey PRIMARY KEY (numero);
+
+
+--
 -- Name: entradas entradas_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -5800,6 +6033,14 @@ ALTER TABLE ONLY public.entradas
 
 ALTER TABLE ONLY public.estoque_cd
     ADD CONSTRAINT estoque_cd_pkey PRIMARY KEY (cod_material, cod_cd);
+
+
+--
+-- Name: ferramentas ferramentas_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ferramentas
+    ADD CONSTRAINT ferramentas_pkey PRIMARY KEY (codigo);
 
 
 --
@@ -5832,6 +6073,22 @@ ALTER TABLE ONLY public.historico_acessos
 
 ALTER TABLE ONLY public.historico_status_compra
     ADD CONSTRAINT historico_status_compra_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: historico_status_separacao historico_status_separacao_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.historico_status_separacao
+    ADD CONSTRAINT historico_status_separacao_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: itens_solicitacao_separacao itens_solicitacao_separacao_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.itens_solicitacao_separacao
+    ADD CONSTRAINT itens_solicitacao_separacao_pkey PRIMARY KEY (numero, item);
 
 
 --
@@ -5899,11 +6156,27 @@ ALTER TABLE ONLY public.solicitacoes_correcao_entrada
 
 
 --
+-- Name: solicitacoes_separacao solicitacoes_separacao_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.solicitacoes_separacao
+    ADD CONSTRAINT solicitacoes_separacao_pkey PRIMARY KEY (numero);
+
+
+--
 -- Name: subconjuntos subconjuntos_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.subconjuntos
     ADD CONSTRAINT subconjuntos_pkey PRIMARY KEY (codigo);
+
+
+--
+-- Name: tipos_ferramenta tipos_ferramenta_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tipos_ferramenta
+    ADD CONSTRAINT tipos_ferramenta_pkey PRIMARY KEY (codigo);
 
 
 --
@@ -6578,6 +6851,27 @@ CREATE INDEX idx_correcao_entrada_status ON public.solicitacoes_correcao_entrada
 
 
 --
+-- Name: idx_emprestimos_ferramenta_cod_ferramenta; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_emprestimos_ferramenta_cod_ferramenta ON public.emprestimos_ferramenta USING btree (cod_ferramenta);
+
+
+--
+-- Name: idx_emprestimos_ferramenta_prevista_devolucao; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_emprestimos_ferramenta_prevista_devolucao ON public.emprestimos_ferramenta USING btree (data_prevista_devolucao);
+
+
+--
+-- Name: idx_emprestimos_ferramenta_tecnico; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_emprestimos_ferramenta_tecnico ON public.emprestimos_ferramenta USING btree (tecnico);
+
+
+--
 -- Name: idx_entradas_data; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -6641,6 +6935,20 @@ CREATE INDEX idx_hist_status_usuario ON public.historico_status_compra USING btr
 
 
 --
+-- Name: idx_historico_status_separacao_numero; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_historico_status_separacao_numero ON public.historico_status_separacao USING btree (numero);
+
+
+--
+-- Name: idx_itens_separacao_numero; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_itens_separacao_numero ON public.itens_solicitacao_separacao USING btree (numero);
+
+
+--
 -- Name: idx_log_qtd_sc; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -6697,6 +7005,13 @@ CREATE INDEX idx_saidas_numero ON public.saidas USING btree (numero);
 
 
 --
+-- Name: idx_saidas_numero_chamado; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_saidas_numero_chamado ON public.saidas USING btree (numero_chamado) WHERE (numero_chamado IS NOT NULL);
+
+
+--
 -- Name: idx_solicitacoes_compra_data; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -6708,6 +7023,27 @@ CREATE INDEX idx_solicitacoes_compra_data ON public.solicitacoes_compra USING bt
 --
 
 CREATE INDEX idx_solicitacoes_compra_numero ON public.solicitacoes_compra USING btree (numero);
+
+
+--
+-- Name: idx_solicitacoes_separacao_numero_chamado; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_solicitacoes_separacao_numero_chamado ON public.solicitacoes_separacao USING btree (numero_chamado) WHERE (numero_chamado IS NOT NULL);
+
+
+--
+-- Name: idx_solicitacoes_separacao_responsavel; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_solicitacoes_separacao_responsavel ON public.solicitacoes_separacao USING btree (responsavel);
+
+
+--
+-- Name: idx_solicitacoes_separacao_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_solicitacoes_separacao_status ON public.solicitacoes_separacao USING btree (status);
 
 
 --
@@ -7071,6 +7407,22 @@ ALTER TABLE ONLY auth.webauthn_credentials
 
 
 --
+-- Name: emprestimos_ferramenta emprestimos_ferramenta_cod_ferramenta_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.emprestimos_ferramenta
+    ADD CONSTRAINT emprestimos_ferramenta_cod_ferramenta_fkey FOREIGN KEY (cod_ferramenta) REFERENCES public.ferramentas(codigo);
+
+
+--
+-- Name: itens_solicitacao_separacao itens_solicitacao_separacao_numero_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.itens_solicitacao_separacao
+    ADD CONSTRAINT itens_solicitacao_separacao_numero_fkey FOREIGN KEY (numero) REFERENCES public.solicitacoes_separacao(numero);
+
+
+--
 -- Name: materiais materiais_cod_subconjunto_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -7239,10 +7591,46 @@ ALTER TABLE auth.sso_providers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE auth.users ENABLE ROW LEVEL SECURITY;
 
 --
+-- Name: emprestimos_ferramenta; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.emprestimos_ferramenta ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: ferramentas; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.ferramentas ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: historico_status_separacao; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.historico_status_separacao ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: itens_solicitacao_separacao; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.itens_solicitacao_separacao ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: solicitacoes_separacao; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.solicitacoes_separacao ENABLE ROW LEVEL SECURITY;
+
+--
 -- Name: subconjuntos; Type: ROW SECURITY; Schema: public; Owner: -
 --
 
 ALTER TABLE public.subconjuntos ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: tipos_ferramenta; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.tipos_ferramenta ENABLE ROW LEVEL SECURITY;
 
 --
 -- Name: messages; Type: ROW SECURITY; Schema: realtime; Owner: -
@@ -7361,5 +7749,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 0XgNukPUesBEgUSr8bSZ66baABTnkULKiB6adoCqir8sQNinGrtUfxBn7TtYuYv
+\unrestrict YSSuawKfMIqSzDKdFg4ljLI5NHVfXYbI7Tn8INiImLbCOSyJNY71UXYDRsaNbN8
 
