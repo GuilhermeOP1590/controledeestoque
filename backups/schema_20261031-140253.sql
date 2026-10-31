@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 1tl4NMWXItSORgiew6n7pKkRJTw1ABE7KKXXXDaeZaspTbJRccMmdbb1bSmFIV6
+\restrict KygzNU1XUF0w4iVRqoRMM3pKtoq4TQa6Foo0Q5R4giMr5dgUHlZIPXud77LXd2K
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.11 (Ubuntu 17.11-1.pgdg24.04+2)
@@ -800,6 +800,22 @@ $$;
 
 
 --
+-- Name: fn_estoque_cd_reativar_sob_demanda(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.fn_estoque_cd_reativar_sob_demanda() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.status_mix = 'INATIVO' AND COALESCE(NEW.estoque, 0) > 0 THEN
+        NEW.status_mix := 'SOB_DEMANDA';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: gerar_proximo_codigo_categoria(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -1483,6 +1499,75 @@ $$;
 
 
 --
+-- Name: authorize(text, text, text, text, text, text[], text[]); Type: FUNCTION; Schema: realtime; Owner: -
+--
+
+CREATE FUNCTION realtime.authorize(role_name text, topic_name text, claims text, sub text, headers text, read_extensions text[], write_extensions text[], OUT read_allowed boolean[], OUT write_allowed boolean[]) RETURNS record
+    LANGUAGE plpgsql
+    AS $$
+declare
+  probe_ids uuid[];
+  probe_inserted_at timestamp := now() at time zone 'utc';
+  visible_ids uuid[];
+  ext text;
+  allowed boolean;
+begin
+  -- The probe inserts are rolled back, but they still give the transaction an xid, so it ends
+  -- in a commit. Nothing durable was written, so skip waiting on the WAL flush and sync standbys.
+  -- Set outside the block below, whose rollback would undo it.
+  perform set_config('synchronous_commit', 'off', true);
+
+  -- The RAISE at the end of this block rolls back everything in it.
+  begin
+    probe_ids := array(select gen_random_uuid() from unnest(read_extensions));
+
+    insert into realtime.messages (id, topic, extension, inserted_at, updated_at)
+    select p.id, topic_name, p.extension, probe_inserted_at, probe_inserted_at
+    from unnest(probe_ids, read_extensions) as p(id, extension);
+
+    perform set_config('role', role_name, true),
+            set_config('realtime.topic', topic_name, true),
+            set_config('request.jwt.claims', claims, true),
+            set_config('request.jwt.claim.sub', sub, true),
+            set_config('request.jwt.claim.role', role_name, true),
+            set_config('request.headers', headers, true);
+
+    -- One lookup for every probe, by the full primary key.
+    visible_ids := array(
+      select m.id
+      from realtime.messages m
+      where m.inserted_at = probe_inserted_at
+        and m.id = any(probe_ids));
+
+    read_allowed := array(
+      select p.id = any(visible_ids)
+      from unnest(probe_ids) with ordinality as p(id, n)
+      order by p.n);
+
+    write_allowed := '{}';
+
+    foreach ext in array write_extensions loop
+      begin
+        insert into realtime.messages (topic, extension, inserted_at, updated_at)
+        values (topic_name, ext, now() at time zone 'utc', now() at time zone 'utc');
+
+        allowed := true;
+      exception when insufficient_privilege then
+        allowed := false;
+      end;
+
+      write_allowed := write_allowed || allowed;
+    end loop;
+
+    raise sqlstate 'RTA01';
+  exception when sqlstate 'RTA01' then
+    null;
+  end;
+end;
+$$;
+
+
+--
 -- Name: broadcast_changes(text, text, text, text, text, record, record, text); Type: FUNCTION; Schema: realtime; Owner: -
 --
 
@@ -1775,6 +1860,76 @@ $$;
 
 
 --
+-- Name: list_changes_sync(name, name, integer, integer); Type: FUNCTION; Schema: realtime; Owner: -
+--
+
+CREATE FUNCTION realtime.list_changes_sync(publication name, slot_name name, max_changes integer, max_record_bytes integer) RETURNS TABLE(wal jsonb, is_rls_enabled boolean, subscription_ids uuid[], errors text[], slot_changes_count bigint)
+    LANGUAGE sql
+    SET log_min_messages TO 'fatal'
+    AS $$
+  WITH pub AS (
+    SELECT
+      concat_ws(
+        ',',
+        CASE WHEN bool_or(pubinsert) THEN 'insert' ELSE NULL END,
+        CASE WHEN bool_or(pubupdate) THEN 'update' ELSE NULL END,
+        CASE WHEN bool_or(pubdelete) THEN 'delete' ELSE NULL END
+      ) AS w2j_actions,
+      coalesce(
+        string_agg(
+          realtime.quote_wal2json(format('%I.%I', schemaname, tablename)::regclass),
+          ','
+        ) filter (WHERE ppt.tablename IS NOT NULL),
+        ''
+      ) AS w2j_add_tables
+    FROM pg_publication pp
+    LEFT JOIN pg_publication_tables ppt ON pp.pubname = ppt.pubname
+    WHERE pp.pubname = publication
+    GROUP BY pp.pubname
+    LIMIT 1
+  ),
+  -- MATERIALIZED ensures the slot is read exactly once.
+  consumed AS MATERIALIZED (
+    SELECT x.*, pub.w2j_add_tables
+    FROM pub,
+         realtime.settled_changes(
+           slot_name, max_changes,
+           'include-pk', 'true',
+           'include-transaction', 'false',
+           'include-timestamp', 'true',
+           'include-type-oids', 'true',
+           'format-version', '2',
+           'actions', pub.w2j_actions,
+           'add-tables', pub.w2j_add_tables
+         ) x
+  ),
+  slot_count AS (
+    SELECT count(*)::bigint AS cnt
+    FROM consumed
+    WHERE consumed.w2j_add_tables <> ''
+  ),
+  rls_filtered AS (
+    SELECT xyz.wal, xyz.is_rls_enabled, xyz.subscription_ids, xyz.errors
+    FROM consumed,
+         realtime.apply_rls(
+           wal := consumed.data::jsonb,
+           max_record_bytes := max_record_bytes
+         ) xyz(wal, is_rls_enabled, subscription_ids, errors)
+    WHERE consumed.w2j_add_tables <> ''
+      AND xyz.subscription_ids[1] IS NOT NULL
+  )
+  SELECT rf.wal, rf.is_rls_enabled, rf.subscription_ids, rf.errors, sc.cnt
+  FROM rls_filtered rf, slot_count sc
+
+  UNION ALL
+
+  SELECT null, null, null, null, sc.cnt
+  FROM slot_count sc
+  WHERE NOT EXISTS (SELECT 1 FROM rls_filtered)
+$$;
+
+
+--
 -- Name: quote_wal2json(regclass); Type: FUNCTION; Schema: realtime; Owner: -
 --
 
@@ -1847,6 +2002,97 @@ BEGIN
       RAISE WARNING 'WarnSendingBroadcastMessage: %', SQLERRM;
   END;
 END;
+$$;
+
+
+--
+-- Name: settled_changes(name, integer, text[]); Type: FUNCTION; Schema: realtime; Owner: -
+--
+
+CREATE FUNCTION realtime.settled_changes(slot_name name, max_changes integer, VARIADIC opts text[]) RETURNS TABLE(lsn pg_lsn, xid xid, data text)
+    LANGUAGE plpgsql
+    AS $$
+declare
+  upto pg_lsn;
+  total bigint;
+  xids xid[];
+  starts bigint[];
+  snapshot pg_snapshot;
+  running_xids xid[];
+  xmax_age int;
+  cut bigint;
+begin
+  -- Each statement in a volatile function takes its own snapshot, which is what lets the
+  -- check below see a writer that was still in flight when the peek ran. Under REPEATABLE
+  -- READ the snapshot never advances, so a deferred change would never be released.
+  if current_setting('transaction_isolation') <> 'read committed' then
+    raise exception 'realtime.settled_changes requires READ COMMITTED';
+  end if;
+
+  -- The peek and the read below cover the same WAL, so the read cannot reach a commit the
+  -- check never saw.
+  upto := pg_current_wal_flush_lsn();
+
+  -- One entry per transaction, in commit order: its xid and the position of its first
+  -- change. The peek uses the caller's own options, so max_changes counts exactly what the
+  -- read counts. A non-transactional logical message is emitted as soon as it is decoded,
+  -- tagged with the xid of whatever transaction wrote it, so it does not mark where that
+  -- transaction starts.
+  select coalesce(sum(g.n), 0),
+         array_agg(g.x order by g.first) filter (where g.first is not null),
+         array_agg(g.first order by g.first) filter (where g.first is not null)
+    into total, xids, starts
+    from (
+      select p.xid as x, count(*) as n,
+             min(p.ord) filter (where not case
+               when starts_with(p.data, '{"action":"M"') then (p.data::jsonb->>'transactional')::boolean is false
+               else false
+             end) as first
+      from pg_logical_slot_peek_changes(slot_name, upto, max_changes, variadic opts)
+           with ordinality as p(lsn, xid, data, ord)
+      group by p.xid
+    ) g;
+
+  -- Nothing for the caller, but the slot still has to move past what the peek covered.
+  if total = 0 then
+    perform pg_replication_slot_advance(slot_name, upto);
+    return;
+  end if;
+
+  if xids is not null then
+    -- Taken after the peek is materialized, so a writer that was still in flight during
+    -- decoding is guaranteed to show up here.
+    snapshot := pg_current_snapshot();
+
+    -- A commit record reaches the WAL before the writer leaves the proc array, so a change
+    -- can be decoded while its row is invisible. apply_rls would resolve a policy against a
+    -- row it cannot see and authorize it for nobody, while the read consumed it regardless.
+    --
+    -- xip lists transactions running when the snapshot was taken. It does not cover a writer
+    -- whose xid sits at or beyond xmax, which never appears there, so the horizon is checked
+    -- too. age() counts backwards from the current xid and so compares correctly across
+    -- wraparound.
+    select coalesce(array_agg(running.x::xid), array[]::xid[])
+      into running_xids
+      from pg_snapshot_xip(snapshot) running(x);
+    xmax_age := age(pg_snapshot_xmax(snapshot)::xid);
+
+    select min(u.s) into cut
+      from unnest(xids, starts) as u(x, s)
+      where u.x = any(running_xids) or age(u.x) <= xmax_age;
+  end if;
+
+  -- The read stops right after the commit that brings its count to upto_nchanges, so the
+  -- count of changes in front of the first unsettled transaction stops it just before that
+  -- transaction.
+  if cut is null then
+    return query
+      select p.* from pg_logical_slot_get_changes(slot_name, upto, max_changes, variadic opts) p;
+  elsif cut > 1 then
+    return query
+      select p.* from pg_logical_slot_get_changes(slot_name, upto, (cut - 1)::int, variadic opts) p;
+  end if;
+end;
 $$;
 
 
@@ -2131,6 +2377,29 @@ begin
     end if;
     return new;
 end;
+$$;
+
+
+--
+-- Name: enforce_versioning_status_transition(); Type: FUNCTION; Schema: storage; Owner: -
+--
+
+CREATE FUNCTION storage.enforce_versioning_status_transition() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.versioning_status = OLD.versioning_status THEN
+        RETURN NEW;
+    END IF;
+
+    IF NEW.versioning_status = 'DISABLED' OR
+       (OLD.versioning_status = 'DISABLED' AND NEW.versioning_status = 'SUSPENDED') THEN
+        RAISE EXCEPTION 'Cannot transition bucket versioning status from % to %',
+            OLD.versioning_status, NEW.versioning_status;
+    END IF;
+
+    RETURN NEW;
+END;
 $$;
 
 
@@ -4652,7 +4921,9 @@ CREATE TABLE public.estoque_cd (
     cod_cd text NOT NULL,
     estoque double precision DEFAULT 0 NOT NULL,
     estoque_minimo double precision DEFAULT 0 NOT NULL,
-    estoque_maximo double precision DEFAULT 0 NOT NULL
+    estoque_maximo double precision DEFAULT 0 NOT NULL,
+    status_mix text DEFAULT 'ATIVO'::text NOT NULL,
+    CONSTRAINT estoque_cd_status_mix_check CHECK ((status_mix = ANY (ARRAY['ATIVO'::text, 'SOB_DEMANDA'::text, 'INATIVO'::text])))
 );
 
 
@@ -4823,6 +5094,39 @@ CREATE TABLE public.localizacoes (
     lado character(1),
     CONSTRAINT localizacoes_lado_check CHECK (((lado IS NULL) OR (lado = ANY (ARRAY['E'::bpchar, 'D'::bpchar]))))
 );
+
+
+--
+-- Name: log_alertas_compras; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.log_alertas_compras (
+    id bigint NOT NULL,
+    usuario text NOT NULL,
+    tipo text NOT NULL,
+    numeros text DEFAULT ''::text NOT NULL,
+    acao text NOT NULL,
+    data_hora timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: log_alertas_compras_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.log_alertas_compras_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: log_alertas_compras_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.log_alertas_compras_id_seq OWNED BY public.log_alertas_compras.id;
 
 
 --
@@ -5401,8 +5705,8 @@ CREATE TABLE realtime.messages (
     payload jsonb,
     event text,
     private boolean DEFAULT false,
-    updated_at timestamp without time zone DEFAULT now() NOT NULL,
-    inserted_at timestamp without time zone DEFAULT now() NOT NULL,
+    updated_at timestamp without time zone DEFAULT timezone('utc'::text, clock_timestamp()) NOT NULL,
+    inserted_at timestamp without time zone DEFAULT timezone('utc'::text, clock_timestamp()) NOT NULL,
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     binary_payload bytea,
     skip_broadcast boolean DEFAULT false NOT NULL
@@ -5478,7 +5782,6 @@ CASE
     ELSE false
 END))),
     CONSTRAINT buckets_lifecycle_configuration_standard_only_check CHECK (((type = 'STANDARD'::storage.buckettype) OR ((lifecycle_configuration IS NULL) AND (lifecycle_configuration_generation IS NULL)))),
-    CONSTRAINT buckets_versioning_dark_check CHECK ((versioning_status = 'DISABLED'::text)),
     CONSTRAINT buckets_versioning_standard_only_check CHECK (((type = 'STANDARD'::storage.buckettype) OR (versioning_status = 'DISABLED'::text))),
     CONSTRAINT buckets_versioning_status_check CHECK ((versioning_status = ANY (ARRAY['DISABLED'::text, 'ENABLED'::text, 'SUSPENDED'::text])))
 );
@@ -5646,6 +5949,13 @@ ALTER TABLE ONLY public.historico_status_compra ALTER COLUMN id SET DEFAULT next
 --
 
 ALTER TABLE ONLY public.historico_status_separacao ALTER COLUMN id SET DEFAULT nextval('public.historico_status_separacao_id_seq'::regclass);
+
+
+--
+-- Name: log_alertas_compras id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.log_alertas_compras ALTER COLUMN id SET DEFAULT nextval('public.log_alertas_compras_id_seq'::regclass);
 
 
 --
@@ -6097,6 +6407,14 @@ ALTER TABLE ONLY public.itens_solicitacao_separacao
 
 ALTER TABLE ONLY public.localizacoes
     ADD CONSTRAINT localizacoes_pkey PRIMARY KEY (codigo);
+
+
+--
+-- Name: log_alertas_compras log_alertas_compras_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.log_alertas_compras
+    ADD CONSTRAINT log_alertas_compras_pkey PRIMARY KEY (id);
 
 
 --
@@ -6900,6 +7218,13 @@ CREATE INDEX idx_entradas_tipo_lancamento ON public.entradas USING btree (tipo_e
 
 
 --
+-- Name: idx_estoque_cd_cd_mix; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_estoque_cd_cd_mix ON public.estoque_cd USING btree (cod_cd, status_mix);
+
+
+--
 -- Name: idx_fornecedores_cnpj; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -6946,6 +7271,13 @@ CREATE INDEX idx_historico_status_separacao_numero ON public.historico_status_se
 --
 
 CREATE INDEX idx_itens_separacao_numero ON public.itens_solicitacao_separacao USING btree (numero);
+
+
+--
+-- Name: idx_log_alertas_compras_usuario; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_log_alertas_compras_usuario ON public.log_alertas_compras USING btree (usuario, data_hora DESC);
 
 
 --
@@ -7159,6 +7491,13 @@ CREATE UNIQUE INDEX vector_indexes_name_bucket_id_idx ON storage.vector_indexes 
 
 
 --
+-- Name: estoque_cd trg_estoque_cd_reativar_sob_demanda; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_estoque_cd_reativar_sob_demanda BEFORE INSERT OR UPDATE ON public.estoque_cd FOR EACH ROW EXECUTE FUNCTION public.fn_estoque_cd_reativar_sob_demanda();
+
+
+--
 -- Name: subscription tr_check_filters; Type: TRIGGER; Schema: realtime; Owner: -
 --
 
@@ -7170,6 +7509,13 @@ CREATE TRIGGER tr_check_filters BEFORE INSERT OR UPDATE ON realtime.subscription
 --
 
 CREATE TRIGGER enforce_bucket_name_length_trigger BEFORE INSERT OR UPDATE OF name ON storage.buckets FOR EACH ROW EXECUTE FUNCTION storage.enforce_bucket_name_length();
+
+
+--
+-- Name: buckets enforce_versioning_status_transition; Type: TRIGGER; Schema: storage; Owner: -
+--
+
+CREATE TRIGGER enforce_versioning_status_transition BEFORE UPDATE OF versioning_status ON storage.buckets FOR EACH ROW EXECUTE FUNCTION storage.enforce_versioning_status_transition();
 
 
 --
@@ -7615,6 +7961,12 @@ ALTER TABLE public.historico_status_separacao ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.itens_solicitacao_separacao ENABLE ROW LEVEL SECURITY;
 
 --
+-- Name: log_alertas_compras; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.log_alertas_compras ENABLE ROW LEVEL SECURITY;
+
+--
 -- Name: solicitacoes_separacao; Type: ROW SECURITY; Schema: public; Owner: -
 --
 
@@ -7749,5 +8101,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 1tl4NMWXItSORgiew6n7pKkRJTw1ABE7KKXXXDaeZaspTbJRccMmdbb1bSmFIV6
+\unrestrict KygzNU1XUF0w4iVRqoRMM3pKtoq4TQa6Foo0Q5R4giMr5dgUHlZIPXud77LXd2K
 
