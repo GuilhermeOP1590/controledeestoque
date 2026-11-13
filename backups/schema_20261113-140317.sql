@@ -2,10 +2,10 @@
 -- PostgreSQL database dump
 --
 
-\restrict RgMWRytOY9yf43CubdLRqGIh7K31keR2rm7SJhFW6AqfybbpSwYctrlolWPNdlT
+\restrict V9cYzWyNeXqfi1n8nfHUjnGGYSsPDF71yJaqj4OmVaUW1YGiM4vbsXtZ2vRMFOc
 
 -- Dumped from database version 17.6
--- Dumped by pg_dump version 17.11 (Ubuntu 17.11-1.pgdg24.04+2)
+-- Dumped by pg_dump version 17.12 (Ubuntu 17.12-1.pgdg26.04+1)
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -775,6 +775,88 @@ $$;
 
 
 --
+-- Name: decrementar_estoque_cd(text, text, numeric); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.decrementar_estoque_cd(p_cod_material text, p_cod_cd text, p_quantidade numeric) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    v_estoque_atual NUMERIC := 0;
+BEGIN
+    SELECT COALESCE(estoque, 0) INTO v_estoque_atual
+    FROM estoque_cd
+    WHERE cod_material = p_cod_material AND cod_cd = p_cod_cd
+    FOR UPDATE;
+    v_estoque_atual := COALESCE(v_estoque_atual, 0);  -- sem linha no CD = saldo 0
+
+    IF v_estoque_atual < p_quantidade THEN
+        RAISE EXCEPTION 'Estoque insuficiente no CD %. Disponível: %, Solicitado: %',
+            p_cod_cd, v_estoque_atual, p_quantidade;
+    END IF;
+
+    INSERT INTO estoque_cd (cod_material, cod_cd, estoque)
+    VALUES (p_cod_material, p_cod_cd, v_estoque_atual - p_quantidade)
+    ON CONFLICT (cod_material, cod_cd)
+    DO UPDATE SET estoque = v_estoque_atual - p_quantidade;
+END;
+$$;
+
+
+--
+-- Name: estornar_item_entrada(integer, text, numeric, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.estornar_item_entrada(p_entrada_id integer, p_cod_material text, p_quantidade numeric, p_cod_cd text) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    v_estoque_global NUMERIC;
+    v_estoque_minimo NUMERIC;
+    v_estoque_cd NUMERIC := 0;
+BEGIN
+    SELECT estoque, estoque_minimo INTO v_estoque_global, v_estoque_minimo
+    FROM materiais WHERE codigo = p_cod_material FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Material % não encontrado.', p_cod_material;
+    END IF;
+
+    IF COALESCE(v_estoque_global, 0) < p_quantidade THEN
+        RAISE EXCEPTION 'Estoque global insuficiente para estornar. Disponível: %, Solicitado: %',
+            COALESCE(v_estoque_global, 0), p_quantidade;
+    END IF;
+
+    SELECT COALESCE(estoque, 0) INTO v_estoque_cd
+    FROM estoque_cd
+    WHERE cod_material = p_cod_material AND cod_cd = p_cod_cd
+    FOR UPDATE;
+    v_estoque_cd := COALESCE(v_estoque_cd, 0);  -- sem linha no CD = saldo 0
+
+    IF v_estoque_cd < p_quantidade THEN
+        RAISE EXCEPTION 'Estoque insuficiente no CD % para estornar. Disponível: %, Solicitado: %',
+            p_cod_cd, v_estoque_cd, p_quantidade;
+    END IF;
+
+    UPDATE materiais SET
+        estoque = estoque - p_quantidade,
+        indicador = CASE WHEN estoque_minimo > 0
+            THEN ROUND(((estoque - p_quantidade) / estoque_minimo)::numeric, 2)::double precision
+            ELSE 0 END
+    WHERE codigo = p_cod_material;
+
+    UPDATE estoque_cd SET estoque = estoque - p_quantidade
+    WHERE cod_material = p_cod_material AND cod_cd = p_cod_cd;
+
+    INSERT INTO log_estornos_entrada (entrada_id, dados_item)
+    SELECT id, to_jsonb(e.*) FROM entradas e WHERE e.id = p_entrada_id;
+
+    DELETE FROM entradas WHERE id = p_entrada_id;
+END;
+$$;
+
+
+--
 -- Name: excluir_e_reordenar_item_solicitacao(text, integer); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -955,6 +1037,22 @@ $$;
 
 
 --
+-- Name: incrementar_estoque_cd(text, text, numeric); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.incrementar_estoque_cd(p_cod_material text, p_cod_cd text, p_quantidade numeric) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    INSERT INTO estoque_cd (cod_material, cod_cd, estoque)
+    VALUES (p_cod_material, p_cod_cd, p_quantidade)
+    ON CONFLICT (cod_material, cod_cd)
+    DO UPDATE SET estoque = estoque_cd.estoque + p_quantidade;
+END;
+$$;
+
+
+--
 -- Name: registrar_entrada_atomica(jsonb, text); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -1124,6 +1222,64 @@ $$;
 
 
 --
+-- Name: transferir_estoque_cd(text, text, text, numeric, text, text, text, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.transferir_estoque_cd(p_cod_material text, p_cod_cd_origem text, p_cod_cd_destino text, p_quantidade numeric, p_descricao text, p_data text, p_observacao text, p_registrado_por text) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    v_estoque_origem NUMERIC := 0;
+    v_estoque_minimo NUMERIC := 0;
+    v_total NUMERIC := 0;
+    v_indicador NUMERIC := 0;
+BEGIN
+    SELECT COALESCE(estoque, 0) INTO v_estoque_origem
+    FROM estoque_cd
+    WHERE cod_material = p_cod_material AND cod_cd = p_cod_cd_origem
+    FOR UPDATE;
+    v_estoque_origem := COALESCE(v_estoque_origem, 0);  -- sem linha no CD = saldo 0
+
+    IF v_estoque_origem < p_quantidade THEN
+        RAISE EXCEPTION 'Estoque insuficiente no CD %. Disponível: %, Solicitado: %',
+            p_cod_cd_origem, v_estoque_origem, p_quantidade;
+    END IF;
+
+    UPDATE estoque_cd
+    SET estoque = v_estoque_origem - p_quantidade
+    WHERE cod_material = p_cod_material AND cod_cd = p_cod_cd_origem;
+
+    INSERT INTO estoque_cd (cod_material, cod_cd, estoque)
+    VALUES (p_cod_material, p_cod_cd_destino, p_quantidade)
+    ON CONFLICT (cod_material, cod_cd)
+    DO UPDATE SET estoque = estoque_cd.estoque + p_quantidade;
+
+    INSERT INTO transferencias_cd (
+        data, cod_material, descricao, quantidade,
+        cd_origem, cd_destino, observacao, registrado_por
+    ) VALUES (
+        p_data, p_cod_material, p_descricao, p_quantidade,
+        p_cod_cd_origem, p_cod_cd_destino, p_observacao, p_registrado_por
+    );
+
+    SELECT COALESCE(SUM(estoque), 0) INTO v_total
+    FROM estoque_cd
+    WHERE cod_material = p_cod_material;
+
+    SELECT COALESCE(estoque_minimo, 0) INTO v_estoque_minimo
+    FROM materiais
+    WHERE codigo = p_cod_material;
+
+    v_indicador := CASE WHEN v_estoque_minimo > 0 THEN ROUND(v_total / v_estoque_minimo, 2) ELSE 0 END;
+
+    UPDATE materiais
+    SET estoque = v_total, indicador = v_indicador
+    WHERE codigo = p_cod_material;
+END;
+$$;
+
+
+--
 -- Name: apply_rls(jsonb, integer); Type: FUNCTION; Schema: realtime; Owner: -
 --
 
@@ -1170,6 +1326,14 @@ declare
     columns realtime.wal_column[];
     -- previous identity values for update/delete
     old_columns realtime.wal_column[];
+
+    -- the same values as wal2json sent them, which is what filters compare against
+    raw_columns realtime.wal_column[] =
+        array_agg((x->>'name', x->>'type', x->>'typeoid', x->'value', null, null)::realtime.wal_column)
+        from jsonb_array_elements(wal -> 'columns') x;
+    raw_old_columns realtime.wal_column[] =
+        array_agg((x->>'name', x->>'type', x->>'typeoid', x->'value', null, null)::realtime.wal_column)
+        from jsonb_array_elements(wal -> 'identity') x;
 
     error_record_exceeds_max_size boolean = octet_length(wal::text) > max_record_bytes;
 
@@ -1329,10 +1493,10 @@ begin
                         subs.entity = entity_
                         and subs.claims_role = working_role
                         and (
-                            realtime.is_visible_through_filters(columns, subs.filters)
+                            realtime.is_visible_through_filters(raw_columns, subs.filters)
                             or (
                               action = 'DELETE'
-                              and realtime.is_visible_through_filters(old_columns, subs.filters)
+                              and realtime.is_visible_through_filters(raw_old_columns, subs.filters)
                             )
                         )
             ) loop
@@ -1756,6 +1920,18 @@ begin
 
     return case when negate then not res else res end;
 end;
+$$;
+
+
+--
+-- Name: filters_hash(realtime.user_defined_filter[]); Type: FUNCTION; Schema: realtime; Owner: -
+--
+
+CREATE FUNCTION realtime.filters_hash(filters realtime.user_defined_filter[]) RETURNS bytea
+    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+    AS $$
+  select pg_catalog.int8send(pg_catalog.hash_array_extended(filters, 0))
+      || pg_catalog.int8send(pg_catalog.hash_array_extended(filters, 1))
 $$;
 
 
@@ -2336,6 +2512,70 @@ $$;
 
 
 --
+-- Name: delete_lifecycle_objects(uuid[]); Type: FUNCTION; Schema: storage; Owner: -
+--
+
+CREATE FUNCTION storage.delete_lifecycle_objects(object_ids uuid[]) RETURNS TABLE(id uuid, is_delete_marker boolean, metadata jsonb)
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    object_id uuid;
+    deleted_row storage.objects%ROWTYPE;
+    deleted_ids uuid[];
+    deleted_markers boolean[];
+    deleted_metadata jsonb[];
+    bulk_deleted boolean := false;
+BEGIN
+    -- Surface pre-existing deferred violations instead of treating them as blocked rows.
+    SET CONSTRAINTS ALL IMMEDIATE;
+    PERFORM set_config('storage.allow_delete_query', 'true', true);
+
+    -- One subxact keeps the subxid cache from overflowing; rows return only once it commits.
+    BEGIN
+        WITH deleted AS (
+            DELETE FROM storage.objects AS object_row
+              WHERE object_row.id = ANY(object_ids) AND object_row.archived_at IS NOT NULL
+              RETURNING object_row.id, object_row.is_delete_marker, object_row.metadata
+        )
+        SELECT array_agg(deleted.id), array_agg(deleted.is_delete_marker), array_agg(deleted.metadata)
+          INTO deleted_ids, deleted_markers, deleted_metadata
+          FROM deleted;
+        bulk_deleted := true;
+    EXCEPTION
+        WHEN OTHERS THEN
+            -- User triggers may use insufficient_privilege to block a row.
+            IF SQLSTATE <> '42501' AND left(SQLSTATE, 2) IN ('08', '40', '42', '53', '55', '57', '58', 'XX') THEN
+                RAISE;
+            END IF;
+    END;
+    IF bulk_deleted THEN
+        RETURN QUERY SELECT * FROM unnest(deleted_ids, deleted_markers, deleted_metadata);
+        RETURN;
+    END IF;
+
+    FOREACH object_id IN ARRAY object_ids LOOP
+        BEGIN
+            DELETE FROM storage.objects AS object_row
+              WHERE object_row.id = object_id AND object_row.archived_at IS NOT NULL
+              RETURNING object_row.* INTO deleted_row;
+            IF FOUND THEN
+                id := deleted_row.id;
+                is_delete_marker := deleted_row.is_delete_marker;
+                metadata := deleted_row.metadata;
+                RETURN NEXT;
+            END IF;
+        EXCEPTION
+            WHEN OTHERS THEN
+                IF SQLSTATE <> '42501' AND left(SQLSTATE, 2) IN ('08', '40', '42', '53', '55', '57', '58', 'XX') THEN
+                    RAISE;
+                END IF;
+        END;
+    END LOOP;
+END;
+$$;
+
+
+--
 -- Name: enforce_bucket_lifecycle_service_role(); Type: FUNCTION; Schema: storage; Owner: -
 --
 
@@ -2344,14 +2584,9 @@ CREATE FUNCTION storage.enforce_bucket_lifecycle_service_role() RETURNS trigger
     SET search_path TO 'pg_catalog'
     AS $$
 BEGIN
-  IF current_user::text IS DISTINCT FROM TG_ARGV[0]
-     AND (
-       OLD.lifecycle_configuration IS DISTINCT FROM NEW.lifecycle_configuration
-       OR OLD.lifecycle_configuration_generation IS DISTINCT FROM NEW.lifecycle_configuration_generation
-     ) THEN
-    -- AFTER runs only after caller RLS has accepted the proposed row. The API
-    -- recognizes this specific error after rolling back its permission probe;
-    -- direct non-service writes still fail and cannot persist the change.
+  IF current_user::text IS DISTINCT FROM TG_ARGV[0] THEN
+    -- Keep this check AFTER caller RLS accepts the proposed row. The API
+    -- recognizes this exact signal after rolling back its permission probe.
     RAISE EXCEPTION 'bucket control columns may only be changed by the configured storage service role'
       USING ERRCODE = 'PST01',
             SCHEMA = TG_TABLE_SCHEMA,
@@ -3218,6 +3453,35 @@ $$;
 
 
 --
+-- Name: protect_active_lifecycle_states(); Type: FUNCTION; Schema: storage; Owner: -
+--
+
+CREATE FUNCTION storage.protect_active_lifecycle_states() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM storage.bucket_lifecycle_states
+        WHERE bucket_id = OLD.id
+          AND NOT (
+              continuation IS NULL
+              OR (continuation @> '{"continuationVersion": 1}' AND continuation #> '{batch,inFlight}' IS NULL)
+          )
+    ) THEN
+        RAISE EXCEPTION 'update or delete on table "buckets" violates foreign key constraint "bucket_lifecycle_states_bucket_id_fkey" on table "bucket_lifecycle_states"'
+            USING ERRCODE = 'foreign_key_violation',
+                  DETAIL = format('Key (id)=(%s) is still referenced from table "bucket_lifecycle_states".', OLD.id),
+                  SCHEMA = 'storage',
+                  TABLE = 'bucket_lifecycle_states',
+                  CONSTRAINT = 'bucket_lifecycle_states_bucket_id_fkey';
+    END IF;
+    RETURN OLD;
+END;
+$$;
+
+
+--
 -- Name: protect_bucket_control_columns(); Type: FUNCTION; Schema: storage; Owner: -
 --
 
@@ -3290,6 +3554,80 @@ BEGIN
                   ERRCODE = '42501';
     END IF;
     RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: reconcile_lifecycle_state(text, boolean); Type: FUNCTION; Schema: storage; Owner: -
+--
+
+CREATE FUNCTION storage.reconcile_lifecycle_state(target_bucket_id text, policy_changed boolean) RETURNS void
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    bucket storage.buckets%ROWTYPE;
+    active boolean;
+    idle boolean;
+    state_generation uuid;
+BEGIN
+    SELECT * INTO bucket FROM storage.buckets WHERE id = target_bucket_id FOR NO KEY UPDATE;
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
+
+    SELECT continuation IS NULL OR (
+               continuation @> '{"continuationVersion": 1}'
+               AND continuation #> '{batch,inFlight}' IS NULL
+           ), generation
+    INTO idle, state_generation
+    FROM storage.bucket_lifecycle_states
+    WHERE bucket_id = target_bucket_id
+    FOR UPDATE;
+
+    IF bucket.lifecycle_configuration IS NULL THEN
+        DELETE FROM storage.bucket_lifecycle_states
+        WHERE bucket_id = target_bucket_id
+          AND idle IS TRUE;
+
+        UPDATE storage.bucket_lifecycle_states
+        SET next_run_at = clock_timestamp(), updated_at = clock_timestamp()
+        WHERE bucket_id = target_bucket_id
+          AND idle IS NOT TRUE;
+        RETURN;
+    END IF;
+
+    active := bucket.versioning_status <> 'DISABLED'
+        AND bucket.lifecycle_configuration @> '{"rules":[{"status":"Enabled"}]}'::jsonb;
+
+    -- The state row records the generation it was reconciled with so callers need not detect
+    -- policy changes. Rows without a recorded generation keep their work.
+    policy_changed := policy_changed OR (
+        state_generation IS NOT NULL AND state_generation <> bucket.lifecycle_configuration_generation
+    );
+
+    INSERT INTO storage.bucket_lifecycle_states AS state (bucket_id, generation, next_run_at)
+    VALUES (bucket.id, bucket.lifecycle_configuration_generation, CASE WHEN active THEN clock_timestamp() END)
+    ON CONFLICT (bucket_id) DO UPDATE
+    SET next_run_at = CASE
+            WHEN policy_changed THEN
+                CASE WHEN active OR idle IS NOT TRUE THEN clock_timestamp() END
+            ELSE EXCLUDED.next_run_at
+        END,
+        generation = EXCLUDED.generation,
+        claim_id = CASE WHEN policy_changed AND idle IS TRUE
+                        THEN NULL ELSE state.claim_id END,
+        claim_until = CASE WHEN policy_changed AND idle IS TRUE
+                           THEN NULL ELSE state.claim_until END,
+        continuation = CASE WHEN policy_changed AND idle IS TRUE
+                            THEN NULL ELSE state.continuation END,
+        failure_count = CASE WHEN policy_changed AND idle IS TRUE
+                             THEN 0 ELSE state.failure_count END,
+        last_error = CASE WHEN policy_changed AND idle IS TRUE
+                          THEN NULL ELSE state.last_error END,
+        updated_at = clock_timestamp()
+    WHERE policy_changed OR (state.next_run_at IS NULL AND EXCLUDED.next_run_at IS NOT NULL);
 END;
 $$;
 
@@ -4101,6 +4439,25 @@ CREATE FUNCTION storage.update_updated_at_column() RETURNS trigger
 BEGIN
     NEW.updated_at = now();
     RETURN NEW; 
+END;
+$$;
+
+
+--
+-- Name: wake_lifecycle_state(); Type: FUNCTION; Schema: storage; Owner: -
+--
+
+CREATE FUNCTION storage.wake_lifecycle_state() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    IF TG_OP = 'INSERT' AND NEW.lifecycle_configuration IS NULL THEN
+        RETURN NEW;
+    END IF;
+
+    PERFORM storage.reconcile_lifecycle_state(NEW.id, false);
+    RETURN NEW;
 END;
 $$;
 
@@ -5214,6 +5571,75 @@ ALTER SEQUENCE public.log_alteracoes_quantidade_sc_id_seq OWNED BY public.log_al
 
 
 --
+-- Name: log_estornos_entrada; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.log_estornos_entrada (
+    id bigint NOT NULL,
+    entrada_id integer NOT NULL,
+    dados_item jsonb NOT NULL,
+    estornado_em timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: log_estornos_entrada_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.log_estornos_entrada_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: log_estornos_entrada_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.log_estornos_entrada_id_seq OWNED BY public.log_estornos_entrada.id;
+
+
+--
+-- Name: log_exclusoes_item_sc; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.log_exclusoes_item_sc (
+    id integer NOT NULL,
+    sc_numero text NOT NULL,
+    sc_item integer NOT NULL,
+    cod_material text,
+    descricao_material text,
+    quantidade numeric(15,4),
+    status_no_momento text NOT NULL,
+    justificativa text NOT NULL,
+    excluido_por text NOT NULL,
+    data_exclusao timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: log_exclusoes_item_sc_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.log_exclusoes_item_sc_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: log_exclusoes_item_sc_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.log_exclusoes_item_sc_id_seq OWNED BY public.log_exclusoes_item_sc.id;
+
+
+--
 -- Name: materiais; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -5709,7 +6135,8 @@ CREATE TABLE realtime.messages (
     inserted_at timestamp without time zone DEFAULT timezone('utc'::text, clock_timestamp()) NOT NULL,
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     binary_payload bytea,
-    skip_broadcast boolean DEFAULT false NOT NULL
+    skip_broadcast boolean DEFAULT false NOT NULL,
+    expires_at timestamp without time zone
 )
 PARTITION BY RANGE (inserted_at);
 
@@ -5753,6 +6180,31 @@ ALTER TABLE realtime.subscription ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTI
     NO MINVALUE
     NO MAXVALUE
     CACHE 1
+);
+
+
+--
+-- Name: bucket_lifecycle_states; Type: TABLE; Schema: storage; Owner: -
+--
+
+CREATE TABLE storage.bucket_lifecycle_states (
+    bucket_id text NOT NULL,
+    generation uuid,
+    next_run_at timestamp with time zone,
+    claim_id uuid,
+    claim_until timestamp with time zone,
+    continuation jsonb,
+    last_started_at timestamp with time zone,
+    last_completed_at timestamp with time zone,
+    last_success_at timestamp with time zone,
+    last_result jsonb,
+    failure_count integer DEFAULT 0 NOT NULL,
+    last_error jsonb,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT bucket_lifecycle_continuation_object_check CHECK (((continuation IS NULL) OR (jsonb_typeof(continuation) = 'object'::text))),
+    CONSTRAINT bucket_lifecycle_failure_count_check CHECK ((failure_count >= 0)),
+    CONSTRAINT bucket_lifecycle_last_result_object_check CHECK (((last_result IS NULL) OR (jsonb_typeof(last_result) = 'object'::text))),
+    CONSTRAINT bucket_lifecycle_recovery_due_check CHECK (((next_run_at IS NOT NULL) OR (NOT jsonb_path_exists(COALESCE(continuation, '{}'::jsonb), '$."batch"."inFlight"'::jsonpath))))
 );
 
 
@@ -5818,6 +6270,19 @@ CREATE TABLE storage.buckets_vectors (
     type storage.buckettype DEFAULT 'VECTOR'::storage.buckettype NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: lifecycle_abandoned_artifacts; Type: TABLE; Schema: storage; Owner: -
+--
+
+CREATE TABLE storage.lifecycle_abandoned_artifacts (
+    bucket_id text NOT NULL,
+    key text NOT NULL,
+    name text NOT NULL,
+    version text,
+    attempted_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
@@ -5970,6 +6435,20 @@ ALTER TABLE ONLY public.log_alteracoes_estoque ALTER COLUMN id SET DEFAULT nextv
 --
 
 ALTER TABLE ONLY public.log_alteracoes_quantidade_sc ALTER COLUMN id SET DEFAULT nextval('public.log_alteracoes_quantidade_sc_id_seq'::regclass);
+
+
+--
+-- Name: log_estornos_entrada id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.log_estornos_entrada ALTER COLUMN id SET DEFAULT nextval('public.log_estornos_entrada_id_seq'::regclass);
+
+
+--
+-- Name: log_exclusoes_item_sc id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.log_exclusoes_item_sc ALTER COLUMN id SET DEFAULT nextval('public.log_exclusoes_item_sc_id_seq'::regclass);
 
 
 --
@@ -6306,6 +6785,14 @@ ALTER TABLE ONLY auth.webauthn_credentials
 
 
 --
+-- Name: categorias categorias_nome_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.categorias
+    ADD CONSTRAINT categorias_nome_unique UNIQUE (nome);
+
+
+--
 -- Name: categorias categorias_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -6431,6 +6918,22 @@ ALTER TABLE ONLY public.log_alteracoes_estoque
 
 ALTER TABLE ONLY public.log_alteracoes_quantidade_sc
     ADD CONSTRAINT log_alteracoes_quantidade_sc_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: log_estornos_entrada log_estornos_entrada_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.log_estornos_entrada
+    ADD CONSTRAINT log_estornos_entrada_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: log_exclusoes_item_sc log_exclusoes_item_sc_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.log_exclusoes_item_sc
+    ADD CONSTRAINT log_exclusoes_item_sc_pkey PRIMARY KEY (id);
 
 
 --
@@ -6586,6 +7089,14 @@ ALTER TABLE ONLY realtime.schema_migrations
 
 
 --
+-- Name: bucket_lifecycle_states bucket_lifecycle_states_pkey; Type: CONSTRAINT; Schema: storage; Owner: -
+--
+
+ALTER TABLE ONLY storage.bucket_lifecycle_states
+    ADD CONSTRAINT bucket_lifecycle_states_pkey PRIMARY KEY (bucket_id);
+
+
+--
 -- Name: buckets_analytics buckets_analytics_pkey; Type: CONSTRAINT; Schema: storage; Owner: -
 --
 
@@ -6607,6 +7118,14 @@ ALTER TABLE ONLY storage.buckets
 
 ALTER TABLE ONLY storage.buckets_vectors
     ADD CONSTRAINT buckets_vectors_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: lifecycle_abandoned_artifacts lifecycle_abandoned_artifacts_pkey; Type: CONSTRAINT; Schema: storage; Owner: -
+--
+
+ALTER TABLE ONLY storage.lifecycle_abandoned_artifacts
+    ADD CONSTRAINT lifecycle_abandoned_artifacts_pkey PRIMARY KEY (bucket_id, key);
 
 
 --
@@ -7281,6 +7800,27 @@ CREATE INDEX idx_log_alertas_compras_usuario ON public.log_alertas_compras USING
 
 
 --
+-- Name: idx_log_estornos_entrada_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_log_estornos_entrada_id ON public.log_estornos_entrada USING btree (entrada_id);
+
+
+--
+-- Name: idx_log_exclusao_sc; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_log_exclusao_sc ON public.log_exclusoes_item_sc USING btree (sc_numero, sc_item);
+
+
+--
+-- Name: idx_log_exclusao_usuario; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_log_exclusao_usuario ON public.log_exclusoes_item_sc USING btree (excluido_por);
+
+
+--
 -- Name: idx_log_qtd_sc; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -7400,17 +7940,17 @@ CREATE INDEX ix_realtime_subscription_entity ON realtime.subscription USING btre
 
 
 --
--- Name: messages_inserted_at_topic_index; Type: INDEX; Schema: realtime; Owner: -
+-- Name: messages_replay_index; Type: INDEX; Schema: realtime; Owner: -
 --
 
-CREATE INDEX messages_inserted_at_topic_index ON ONLY realtime.messages USING btree (inserted_at DESC, topic) WHERE ((extension = 'broadcast'::text) AND (private IS TRUE));
+CREATE INDEX messages_replay_index ON ONLY realtime.messages USING btree (topic, inserted_at DESC, COALESCE(expires_at, 'infinity'::timestamp without time zone)) WHERE ((extension = 'broadcast'::text) AND (private = true));
 
 
 --
--- Name: subscription_subscription_id_entity_filters_action_filter_selec; Type: INDEX; Schema: realtime; Owner: -
+-- Name: subscription_subscription_id_entity_filters_hash_key; Type: INDEX; Schema: realtime; Owner: -
 --
 
-CREATE UNIQUE INDEX subscription_subscription_id_entity_filters_action_filter_selec ON realtime.subscription USING btree (subscription_id, entity, filters, action_filter, COALESCE(selected_columns, '{}'::text[]));
+CREATE UNIQUE INDEX subscription_subscription_id_entity_filters_hash_key ON realtime.subscription USING btree (subscription_id, entity, realtime.filters_hash(filters), action_filter, COALESCE(selected_columns, '{}'::text[]));
 
 
 --
@@ -7418,6 +7958,13 @@ CREATE UNIQUE INDEX subscription_subscription_id_entity_filters_action_filter_se
 --
 
 CREATE UNIQUE INDEX bname ON storage.buckets USING btree (name);
+
+
+--
+-- Name: bucket_lifecycle_states_due_idx; Type: INDEX; Schema: storage; Owner: -
+--
+
+CREATE INDEX bucket_lifecycle_states_due_idx ON storage.bucket_lifecycle_states USING btree (next_run_at, bucket_id) WHERE (next_run_at IS NOT NULL);
 
 
 --
@@ -7470,10 +8017,31 @@ CREATE UNIQUE INDEX idx_objects_null_version ON storage.objects USING btree (buc
 
 
 --
+-- Name: lifecycle_abandoned_artifacts_attempted_at_idx; Type: INDEX; Schema: storage; Owner: -
+--
+
+CREATE INDEX lifecycle_abandoned_artifacts_attempted_at_idx ON storage.lifecycle_abandoned_artifacts USING btree (attempted_at);
+
+
+--
 -- Name: name_prefix_search; Type: INDEX; Schema: storage; Owner: -
 --
 
 CREATE INDEX name_prefix_search ON storage.objects USING btree (name text_pattern_ops);
+
+
+--
+-- Name: objects_archived_due_idx; Type: INDEX; Schema: storage; Owner: -
+--
+
+CREATE INDEX objects_archived_due_idx ON storage.objects USING btree (bucket_id, archived_at, name COLLATE "C") INCLUDE (id, version, is_delete_marker) WHERE (archived_at IS NOT NULL);
+
+
+--
+-- Name: objects_archived_order_uq; Type: INDEX; Schema: storage; Owner: -
+--
+
+CREATE UNIQUE INDEX objects_archived_order_uq ON storage.objects USING btree (bucket_id, name COLLATE "C", archived_at) WHERE (archived_at IS NOT NULL);
 
 
 --
@@ -7519,6 +8087,13 @@ CREATE TRIGGER enforce_versioning_status_transition BEFORE UPDATE OF versioning_
 
 
 --
+-- Name: buckets protect_active_lifecycle_states; Type: TRIGGER; Schema: storage; Owner: -
+--
+
+CREATE TRIGGER protect_active_lifecycle_states BEFORE DELETE ON storage.buckets FOR EACH ROW EXECUTE FUNCTION storage.protect_active_lifecycle_states();
+
+
+--
 -- Name: buckets protect_bucket_control_insert; Type: TRIGGER; Schema: storage; Owner: -
 --
 
@@ -7558,6 +8133,20 @@ CREATE TRIGGER protect_objects_delete BEFORE DELETE ON storage.objects FOR EACH 
 --
 
 CREATE TRIGGER update_objects_updated_at BEFORE UPDATE ON storage.objects FOR EACH ROW EXECUTE FUNCTION storage.update_updated_at_column();
+
+
+--
+-- Name: buckets wake_lifecycle_on_policy_write; Type: TRIGGER; Schema: storage; Owner: -
+--
+
+CREATE TRIGGER wake_lifecycle_on_policy_write AFTER INSERT OR UPDATE OF lifecycle_configuration_generation ON storage.buckets FOR EACH ROW EXECUTE FUNCTION storage.wake_lifecycle_state();
+
+
+--
+-- Name: buckets wake_lifecycle_on_versioning_enable; Type: TRIGGER; Schema: storage; Owner: -
+--
+
+CREATE TRIGGER wake_lifecycle_on_versioning_enable AFTER UPDATE OF versioning_status ON storage.buckets FOR EACH ROW WHEN ((new.lifecycle_configuration IS NOT NULL)) EXECUTE FUNCTION storage.wake_lifecycle_state();
 
 
 --
@@ -7801,6 +8390,14 @@ ALTER TABLE ONLY public.usuario_transacoes
 
 
 --
+-- Name: bucket_lifecycle_states bucket_lifecycle_states_bucket_id_fkey; Type: FK CONSTRAINT; Schema: storage; Owner: -
+--
+
+ALTER TABLE ONLY storage.bucket_lifecycle_states
+    ADD CONSTRAINT bucket_lifecycle_states_bucket_id_fkey FOREIGN KEY (bucket_id) REFERENCES storage.buckets(id) ON DELETE CASCADE;
+
+
+--
 -- Name: objects objects_bucketId_fkey; Type: FK CONSTRAINT; Schema: storage; Owner: -
 --
 
@@ -7967,6 +8564,18 @@ ALTER TABLE public.itens_solicitacao_separacao ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.log_alertas_compras ENABLE ROW LEVEL SECURITY;
 
 --
+-- Name: log_estornos_entrada; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.log_estornos_entrada ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: log_exclusoes_item_sc; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.log_exclusoes_item_sc ENABLE ROW LEVEL SECURITY;
+
+--
 -- Name: solicitacoes_separacao; Type: ROW SECURITY; Schema: public; Owner: -
 --
 
@@ -7991,6 +8600,12 @@ ALTER TABLE public.tipos_ferramenta ENABLE ROW LEVEL SECURITY;
 ALTER TABLE realtime.messages ENABLE ROW LEVEL SECURITY;
 
 --
+-- Name: bucket_lifecycle_states; Type: ROW SECURITY; Schema: storage; Owner: -
+--
+
+ALTER TABLE storage.bucket_lifecycle_states ENABLE ROW LEVEL SECURITY;
+
+--
 -- Name: buckets; Type: ROW SECURITY; Schema: storage; Owner: -
 --
 
@@ -8007,6 +8622,12 @@ ALTER TABLE storage.buckets_analytics ENABLE ROW LEVEL SECURITY;
 --
 
 ALTER TABLE storage.buckets_vectors ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: lifecycle_abandoned_artifacts; Type: ROW SECURITY; Schema: storage; Owner: -
+--
+
+ALTER TABLE storage.lifecycle_abandoned_artifacts ENABLE ROW LEVEL SECURITY;
 
 --
 -- Name: migrations; Type: ROW SECURITY; Schema: storage; Owner: -
@@ -8101,5 +8722,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict RgMWRytOY9yf43CubdLRqGIh7K31keR2rm7SJhFW6AqfybbpSwYctrlolWPNdlT
+\unrestrict V9cYzWyNeXqfi1n8nfHUjnGGYSsPDF71yJaqj4OmVaUW1YGiM4vbsXtZ2vRMFOc
 
