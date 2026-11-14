@@ -2,10 +2,10 @@
 -- PostgreSQL database dump
 --
 
-\restrict 8Inl4ZagcfxqmYtp63IDHj5xfBvf33OCIWiNZB17KQQvuCDse0AbgcsbVLfSPRY
+\restrict UuXxOQcxAodX31PBgPHXzKXvgovyCYNlmeQj76bvBDnyOpLNg8LUdkIoq7jI7Wf
 
 -- Dumped from database version 17.6
--- Dumped by pg_dump version 17.11 (Ubuntu 17.11-1.pgdg26.04+2)
+-- Dumped by pg_dump version 17.12 (Ubuntu 17.12-1.pgdg26.04+1)
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -775,6 +775,88 @@ $$;
 
 
 --
+-- Name: decrementar_estoque_cd(text, text, numeric); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.decrementar_estoque_cd(p_cod_material text, p_cod_cd text, p_quantidade numeric) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    v_estoque_atual NUMERIC := 0;
+BEGIN
+    SELECT COALESCE(estoque, 0) INTO v_estoque_atual
+    FROM estoque_cd
+    WHERE cod_material = p_cod_material AND cod_cd = p_cod_cd
+    FOR UPDATE;
+    v_estoque_atual := COALESCE(v_estoque_atual, 0);  -- sem linha no CD = saldo 0
+
+    IF v_estoque_atual < p_quantidade THEN
+        RAISE EXCEPTION 'Estoque insuficiente no CD %. Disponível: %, Solicitado: %',
+            p_cod_cd, v_estoque_atual, p_quantidade;
+    END IF;
+
+    INSERT INTO estoque_cd (cod_material, cod_cd, estoque)
+    VALUES (p_cod_material, p_cod_cd, v_estoque_atual - p_quantidade)
+    ON CONFLICT (cod_material, cod_cd)
+    DO UPDATE SET estoque = v_estoque_atual - p_quantidade;
+END;
+$$;
+
+
+--
+-- Name: estornar_item_entrada(integer, text, numeric, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.estornar_item_entrada(p_entrada_id integer, p_cod_material text, p_quantidade numeric, p_cod_cd text) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    v_estoque_global NUMERIC;
+    v_estoque_minimo NUMERIC;
+    v_estoque_cd NUMERIC := 0;
+BEGIN
+    SELECT estoque, estoque_minimo INTO v_estoque_global, v_estoque_minimo
+    FROM materiais WHERE codigo = p_cod_material FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Material % não encontrado.', p_cod_material;
+    END IF;
+
+    IF COALESCE(v_estoque_global, 0) < p_quantidade THEN
+        RAISE EXCEPTION 'Estoque global insuficiente para estornar. Disponível: %, Solicitado: %',
+            COALESCE(v_estoque_global, 0), p_quantidade;
+    END IF;
+
+    SELECT COALESCE(estoque, 0) INTO v_estoque_cd
+    FROM estoque_cd
+    WHERE cod_material = p_cod_material AND cod_cd = p_cod_cd
+    FOR UPDATE;
+    v_estoque_cd := COALESCE(v_estoque_cd, 0);  -- sem linha no CD = saldo 0
+
+    IF v_estoque_cd < p_quantidade THEN
+        RAISE EXCEPTION 'Estoque insuficiente no CD % para estornar. Disponível: %, Solicitado: %',
+            p_cod_cd, v_estoque_cd, p_quantidade;
+    END IF;
+
+    UPDATE materiais SET
+        estoque = estoque - p_quantidade,
+        indicador = CASE WHEN estoque_minimo > 0
+            THEN ROUND(((estoque - p_quantidade) / estoque_minimo)::numeric, 2)::double precision
+            ELSE 0 END
+    WHERE codigo = p_cod_material;
+
+    UPDATE estoque_cd SET estoque = estoque - p_quantidade
+    WHERE cod_material = p_cod_material AND cod_cd = p_cod_cd;
+
+    INSERT INTO log_estornos_entrada (entrada_id, dados_item)
+    SELECT id, to_jsonb(e.*) FROM entradas e WHERE e.id = p_entrada_id;
+
+    DELETE FROM entradas WHERE id = p_entrada_id;
+END;
+$$;
+
+
+--
 -- Name: excluir_e_reordenar_item_solicitacao(text, integer); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -955,6 +1037,22 @@ $$;
 
 
 --
+-- Name: incrementar_estoque_cd(text, text, numeric); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.incrementar_estoque_cd(p_cod_material text, p_cod_cd text, p_quantidade numeric) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    INSERT INTO estoque_cd (cod_material, cod_cd, estoque)
+    VALUES (p_cod_material, p_cod_cd, p_quantidade)
+    ON CONFLICT (cod_material, cod_cd)
+    DO UPDATE SET estoque = estoque_cd.estoque + p_quantidade;
+END;
+$$;
+
+
+--
 -- Name: registrar_entrada_atomica(jsonb, text); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -1124,6 +1222,64 @@ $$;
 
 
 --
+-- Name: transferir_estoque_cd(text, text, text, numeric, text, text, text, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.transferir_estoque_cd(p_cod_material text, p_cod_cd_origem text, p_cod_cd_destino text, p_quantidade numeric, p_descricao text, p_data text, p_observacao text, p_registrado_por text) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    v_estoque_origem NUMERIC := 0;
+    v_estoque_minimo NUMERIC := 0;
+    v_total NUMERIC := 0;
+    v_indicador NUMERIC := 0;
+BEGIN
+    SELECT COALESCE(estoque, 0) INTO v_estoque_origem
+    FROM estoque_cd
+    WHERE cod_material = p_cod_material AND cod_cd = p_cod_cd_origem
+    FOR UPDATE;
+    v_estoque_origem := COALESCE(v_estoque_origem, 0);  -- sem linha no CD = saldo 0
+
+    IF v_estoque_origem < p_quantidade THEN
+        RAISE EXCEPTION 'Estoque insuficiente no CD %. Disponível: %, Solicitado: %',
+            p_cod_cd_origem, v_estoque_origem, p_quantidade;
+    END IF;
+
+    UPDATE estoque_cd
+    SET estoque = v_estoque_origem - p_quantidade
+    WHERE cod_material = p_cod_material AND cod_cd = p_cod_cd_origem;
+
+    INSERT INTO estoque_cd (cod_material, cod_cd, estoque)
+    VALUES (p_cod_material, p_cod_cd_destino, p_quantidade)
+    ON CONFLICT (cod_material, cod_cd)
+    DO UPDATE SET estoque = estoque_cd.estoque + p_quantidade;
+
+    INSERT INTO transferencias_cd (
+        data, cod_material, descricao, quantidade,
+        cd_origem, cd_destino, observacao, registrado_por
+    ) VALUES (
+        p_data, p_cod_material, p_descricao, p_quantidade,
+        p_cod_cd_origem, p_cod_cd_destino, p_observacao, p_registrado_por
+    );
+
+    SELECT COALESCE(SUM(estoque), 0) INTO v_total
+    FROM estoque_cd
+    WHERE cod_material = p_cod_material;
+
+    SELECT COALESCE(estoque_minimo, 0) INTO v_estoque_minimo
+    FROM materiais
+    WHERE codigo = p_cod_material;
+
+    v_indicador := CASE WHEN v_estoque_minimo > 0 THEN ROUND(v_total / v_estoque_minimo, 2) ELSE 0 END;
+
+    UPDATE materiais
+    SET estoque = v_total, indicador = v_indicador
+    WHERE codigo = p_cod_material;
+END;
+$$;
+
+
+--
 -- Name: apply_rls(jsonb, integer); Type: FUNCTION; Schema: realtime; Owner: -
 --
 
@@ -1170,6 +1326,14 @@ declare
     columns realtime.wal_column[];
     -- previous identity values for update/delete
     old_columns realtime.wal_column[];
+
+    -- the same values as wal2json sent them, which is what filters compare against
+    raw_columns realtime.wal_column[] =
+        array_agg((x->>'name', x->>'type', x->>'typeoid', x->'value', null, null)::realtime.wal_column)
+        from jsonb_array_elements(wal -> 'columns') x;
+    raw_old_columns realtime.wal_column[] =
+        array_agg((x->>'name', x->>'type', x->>'typeoid', x->'value', null, null)::realtime.wal_column)
+        from jsonb_array_elements(wal -> 'identity') x;
 
     error_record_exceeds_max_size boolean = octet_length(wal::text) > max_record_bytes;
 
@@ -1329,10 +1493,10 @@ begin
                         subs.entity = entity_
                         and subs.claims_role = working_role
                         and (
-                            realtime.is_visible_through_filters(columns, subs.filters)
+                            realtime.is_visible_through_filters(raw_columns, subs.filters)
                             or (
                               action = 'DELETE'
-                              and realtime.is_visible_through_filters(old_columns, subs.filters)
+                              and realtime.is_visible_through_filters(raw_old_columns, subs.filters)
                             )
                         )
             ) loop
@@ -1756,6 +1920,18 @@ begin
 
     return case when negate then not res else res end;
 end;
+$$;
+
+
+--
+-- Name: filters_hash(realtime.user_defined_filter[]); Type: FUNCTION; Schema: realtime; Owner: -
+--
+
+CREATE FUNCTION realtime.filters_hash(filters realtime.user_defined_filter[]) RETURNS bytea
+    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+    AS $$
+  select pg_catalog.int8send(pg_catalog.hash_array_extended(filters, 0))
+      || pg_catalog.int8send(pg_catalog.hash_array_extended(filters, 1))
 $$;
 
 
@@ -5395,6 +5571,75 @@ ALTER SEQUENCE public.log_alteracoes_quantidade_sc_id_seq OWNED BY public.log_al
 
 
 --
+-- Name: log_estornos_entrada; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.log_estornos_entrada (
+    id bigint NOT NULL,
+    entrada_id integer NOT NULL,
+    dados_item jsonb NOT NULL,
+    estornado_em timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: log_estornos_entrada_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.log_estornos_entrada_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: log_estornos_entrada_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.log_estornos_entrada_id_seq OWNED BY public.log_estornos_entrada.id;
+
+
+--
+-- Name: log_exclusoes_item_sc; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.log_exclusoes_item_sc (
+    id integer NOT NULL,
+    sc_numero text NOT NULL,
+    sc_item integer NOT NULL,
+    cod_material text,
+    descricao_material text,
+    quantidade numeric(15,4),
+    status_no_momento text NOT NULL,
+    justificativa text NOT NULL,
+    excluido_por text NOT NULL,
+    data_exclusao timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: log_exclusoes_item_sc_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.log_exclusoes_item_sc_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: log_exclusoes_item_sc_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.log_exclusoes_item_sc_id_seq OWNED BY public.log_exclusoes_item_sc.id;
+
+
+--
 -- Name: materiais; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -5890,7 +6135,8 @@ CREATE TABLE realtime.messages (
     inserted_at timestamp without time zone DEFAULT timezone('utc'::text, clock_timestamp()) NOT NULL,
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     binary_payload bytea,
-    skip_broadcast boolean DEFAULT false NOT NULL
+    skip_broadcast boolean DEFAULT false NOT NULL,
+    expires_at timestamp without time zone
 )
 PARTITION BY RANGE (inserted_at);
 
@@ -6189,6 +6435,20 @@ ALTER TABLE ONLY public.log_alteracoes_estoque ALTER COLUMN id SET DEFAULT nextv
 --
 
 ALTER TABLE ONLY public.log_alteracoes_quantidade_sc ALTER COLUMN id SET DEFAULT nextval('public.log_alteracoes_quantidade_sc_id_seq'::regclass);
+
+
+--
+-- Name: log_estornos_entrada id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.log_estornos_entrada ALTER COLUMN id SET DEFAULT nextval('public.log_estornos_entrada_id_seq'::regclass);
+
+
+--
+-- Name: log_exclusoes_item_sc id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.log_exclusoes_item_sc ALTER COLUMN id SET DEFAULT nextval('public.log_exclusoes_item_sc_id_seq'::regclass);
 
 
 --
@@ -6525,6 +6785,14 @@ ALTER TABLE ONLY auth.webauthn_credentials
 
 
 --
+-- Name: categorias categorias_nome_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.categorias
+    ADD CONSTRAINT categorias_nome_unique UNIQUE (nome);
+
+
+--
 -- Name: categorias categorias_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -6650,6 +6918,22 @@ ALTER TABLE ONLY public.log_alteracoes_estoque
 
 ALTER TABLE ONLY public.log_alteracoes_quantidade_sc
     ADD CONSTRAINT log_alteracoes_quantidade_sc_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: log_estornos_entrada log_estornos_entrada_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.log_estornos_entrada
+    ADD CONSTRAINT log_estornos_entrada_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: log_exclusoes_item_sc log_exclusoes_item_sc_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.log_exclusoes_item_sc
+    ADD CONSTRAINT log_exclusoes_item_sc_pkey PRIMARY KEY (id);
 
 
 --
@@ -7516,6 +7800,27 @@ CREATE INDEX idx_log_alertas_compras_usuario ON public.log_alertas_compras USING
 
 
 --
+-- Name: idx_log_estornos_entrada_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_log_estornos_entrada_id ON public.log_estornos_entrada USING btree (entrada_id);
+
+
+--
+-- Name: idx_log_exclusao_sc; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_log_exclusao_sc ON public.log_exclusoes_item_sc USING btree (sc_numero, sc_item);
+
+
+--
+-- Name: idx_log_exclusao_usuario; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_log_exclusao_usuario ON public.log_exclusoes_item_sc USING btree (excluido_por);
+
+
+--
 -- Name: idx_log_qtd_sc; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -7635,17 +7940,17 @@ CREATE INDEX ix_realtime_subscription_entity ON realtime.subscription USING btre
 
 
 --
--- Name: messages_inserted_at_topic_index; Type: INDEX; Schema: realtime; Owner: -
+-- Name: messages_replay_index; Type: INDEX; Schema: realtime; Owner: -
 --
 
-CREATE INDEX messages_inserted_at_topic_index ON ONLY realtime.messages USING btree (inserted_at DESC, topic) WHERE ((extension = 'broadcast'::text) AND (private IS TRUE));
+CREATE INDEX messages_replay_index ON ONLY realtime.messages USING btree (topic, inserted_at DESC, COALESCE(expires_at, 'infinity'::timestamp without time zone)) WHERE ((extension = 'broadcast'::text) AND (private = true));
 
 
 --
--- Name: subscription_subscription_id_entity_filters_action_filter_selec; Type: INDEX; Schema: realtime; Owner: -
+-- Name: subscription_subscription_id_entity_filters_hash_key; Type: INDEX; Schema: realtime; Owner: -
 --
 
-CREATE UNIQUE INDEX subscription_subscription_id_entity_filters_action_filter_selec ON realtime.subscription USING btree (subscription_id, entity, filters, action_filter, COALESCE(selected_columns, '{}'::text[]));
+CREATE UNIQUE INDEX subscription_subscription_id_entity_filters_hash_key ON realtime.subscription USING btree (subscription_id, entity, realtime.filters_hash(filters), action_filter, COALESCE(selected_columns, '{}'::text[]));
 
 
 --
@@ -8259,6 +8564,18 @@ ALTER TABLE public.itens_solicitacao_separacao ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.log_alertas_compras ENABLE ROW LEVEL SECURITY;
 
 --
+-- Name: log_estornos_entrada; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.log_estornos_entrada ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: log_exclusoes_item_sc; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.log_exclusoes_item_sc ENABLE ROW LEVEL SECURITY;
+
+--
 -- Name: solicitacoes_separacao; Type: ROW SECURITY; Schema: public; Owner: -
 --
 
@@ -8405,5 +8722,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 8Inl4ZagcfxqmYtp63IDHj5xfBvf33OCIWiNZB17KQQvuCDse0AbgcsbVLfSPRY
+\unrestrict UuXxOQcxAodX31PBgPHXzKXvgovyCYNlmeQj76bvBDnyOpLNg8LUdkIoq7jI7Wf
 
