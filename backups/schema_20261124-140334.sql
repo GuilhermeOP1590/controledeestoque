@@ -2,10 +2,10 @@
 -- PostgreSQL database dump
 --
 
-\restrict 6SitIhcJ5rai0qp3gekE5i36YjIdDFIiNM8funHZ7bVsI3W76C8qb28IDTYqnHZ
+\restrict 5qUG65a7dyShuLaTyBN8gGHoxPGycEaHSsLvSB5W9XZSaVL4bWNjNlBYVi2VVKe
 
 -- Dumped from database version 17.6
--- Dumped by pg_dump version 17.11 (Ubuntu 17.11-1.pgdg26.04+2)
+-- Dumped by pg_dump version 17.12 (Ubuntu 17.12-1.pgdg26.04+1)
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -775,6 +775,88 @@ $$;
 
 
 --
+-- Name: decrementar_estoque_cd(text, text, numeric); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.decrementar_estoque_cd(p_cod_material text, p_cod_cd text, p_quantidade numeric) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    v_estoque_atual NUMERIC := 0;
+BEGIN
+    SELECT COALESCE(estoque, 0) INTO v_estoque_atual
+    FROM estoque_cd
+    WHERE cod_material = p_cod_material AND cod_cd = p_cod_cd
+    FOR UPDATE;
+    v_estoque_atual := COALESCE(v_estoque_atual, 0);  -- sem linha no CD = saldo 0
+
+    IF v_estoque_atual < p_quantidade THEN
+        RAISE EXCEPTION 'Estoque insuficiente no CD %. Disponível: %, Solicitado: %',
+            p_cod_cd, v_estoque_atual, p_quantidade;
+    END IF;
+
+    INSERT INTO estoque_cd (cod_material, cod_cd, estoque)
+    VALUES (p_cod_material, p_cod_cd, v_estoque_atual - p_quantidade)
+    ON CONFLICT (cod_material, cod_cd)
+    DO UPDATE SET estoque = v_estoque_atual - p_quantidade;
+END;
+$$;
+
+
+--
+-- Name: estornar_item_entrada(integer, text, numeric, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.estornar_item_entrada(p_entrada_id integer, p_cod_material text, p_quantidade numeric, p_cod_cd text) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    v_estoque_global NUMERIC;
+    v_estoque_minimo NUMERIC;
+    v_estoque_cd NUMERIC := 0;
+BEGIN
+    SELECT estoque, estoque_minimo INTO v_estoque_global, v_estoque_minimo
+    FROM materiais WHERE codigo = p_cod_material FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Material % não encontrado.', p_cod_material;
+    END IF;
+
+    IF COALESCE(v_estoque_global, 0) < p_quantidade THEN
+        RAISE EXCEPTION 'Estoque global insuficiente para estornar. Disponível: %, Solicitado: %',
+            COALESCE(v_estoque_global, 0), p_quantidade;
+    END IF;
+
+    SELECT COALESCE(estoque, 0) INTO v_estoque_cd
+    FROM estoque_cd
+    WHERE cod_material = p_cod_material AND cod_cd = p_cod_cd
+    FOR UPDATE;
+    v_estoque_cd := COALESCE(v_estoque_cd, 0);  -- sem linha no CD = saldo 0
+
+    IF v_estoque_cd < p_quantidade THEN
+        RAISE EXCEPTION 'Estoque insuficiente no CD % para estornar. Disponível: %, Solicitado: %',
+            p_cod_cd, v_estoque_cd, p_quantidade;
+    END IF;
+
+    UPDATE materiais SET
+        estoque = estoque - p_quantidade,
+        indicador = CASE WHEN estoque_minimo > 0
+            THEN ROUND(((estoque - p_quantidade) / estoque_minimo)::numeric, 2)::double precision
+            ELSE 0 END
+    WHERE codigo = p_cod_material;
+
+    UPDATE estoque_cd SET estoque = estoque - p_quantidade
+    WHERE cod_material = p_cod_material AND cod_cd = p_cod_cd;
+
+    INSERT INTO log_estornos_entrada (entrada_id, dados_item)
+    SELECT id, to_jsonb(e.*) FROM entradas e WHERE e.id = p_entrada_id;
+
+    DELETE FROM entradas WHERE id = p_entrada_id;
+END;
+$$;
+
+
+--
 -- Name: excluir_e_reordenar_item_solicitacao(text, integer); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -955,6 +1037,250 @@ $$;
 
 
 --
+-- Name: incrementar_estoque_cd(text, text, numeric); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.incrementar_estoque_cd(p_cod_material text, p_cod_cd text, p_quantidade numeric) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    INSERT INTO estoque_cd (cod_material, cod_cd, estoque)
+    VALUES (p_cod_material, p_cod_cd, p_quantidade)
+    ON CONFLICT (cod_material, cod_cd)
+    DO UPDATE SET estoque = estoque_cd.estoque + p_quantidade;
+END;
+$$;
+
+
+--
+-- Name: inv_concluir(integer, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.inv_concluir(p_inventario_id integer, p_usuario text) RETURNS numeric
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    inv inventarios%ROWTYPE;
+    v_total INTEGER; v_certos INTEGER; v_acur NUMERIC;
+BEGIN
+    SELECT * INTO inv FROM inventarios WHERE id = p_inventario_id FOR UPDATE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Inventário não encontrado.'; END IF;
+    IF inv.status <> 'EM_REVISAO' THEN
+        RAISE EXCEPTION 'Só é possível concluir inventário EM REVISÃO (status atual %).', inv.status;
+    END IF;
+    IF EXISTS (SELECT 1 FROM inventario_itens WHERE inventario_id = inv.id
+                AND status NOT IN ('OK', 'AJUSTADO', 'IGNORADO')) THEN
+        RAISE EXCEPTION 'Ainda há itens divergentes sem decisão.';
+    END IF;
+    SELECT count(*),
+           count(*) FILTER (WHERE inv_dentro_tolerancia(qtd_contada, saldo_contagem,
+                                                         inv.tolerancia_pct, inv.tolerancia_abs))
+      INTO v_total, v_certos
+      FROM inventario_itens WHERE inventario_id = inv.id;
+    v_acur := CASE WHEN v_total > 0 THEN round(100.0 * v_certos / v_total, 1) ELSE 100 END;
+    UPDATE inventarios
+       SET status = 'CONCLUIDO', concluido_em = now(), concluido_por = p_usuario, acuracia = v_acur
+     WHERE id = inv.id;
+    INSERT INTO inventario_eventos (inventario_id, evento, usuario, detalhe)
+    VALUES (inv.id, 'CONCLUIDO', p_usuario, format('Acurácia da 1ª contagem: %s%% (%s de %s itens)', v_acur, v_certos, v_total));
+    RETURN v_acur;
+END;
+$$;
+
+
+--
+-- Name: inv_decidir_item(integer, text, text, text, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.inv_decidir_item(p_item_id integer, p_acao text, p_usuario text, p_justificativa text DEFAULT NULL::text, p_recontador text DEFAULT NULL::text) RETURNS text
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    it   inventario_itens%ROWTYPE;
+    inv  inventarios%ROWTYPE;
+    v_final NUMERIC; v_ref NUMERIC; v_delta NUMERIC;
+    v_atual NUMERIC; v_novo NUMERIC; v_total NUMERIC; v_min NUMERIC;
+BEGIN
+    SELECT * INTO it FROM inventario_itens WHERE id = p_item_id FOR UPDATE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Item de inventário não encontrado.'; END IF;
+    SELECT * INTO inv FROM inventarios WHERE id = it.inventario_id FOR UPDATE;
+    IF inv.status NOT IN ('ABERTO', 'EM_REVISAO') THEN
+        RAISE EXCEPTION 'O inventário #% está %.', inv.id, inv.status;
+    END IF;
+    IF it.status <> 'DIVERGENTE' THEN
+        RAISE EXCEPTION 'Só itens DIVERGENTES recebem decisão (item % está %).', it.cod_material, it.status;
+    END IF;
+    IF p_usuario = it.contado_por OR p_usuario = it.recontado_por THEN
+        RAISE EXCEPTION 'Quem contou o item não pode decidir sobre ele (segregação de funções).';
+    END IF;
+
+    IF p_acao = 'RECONTAR' THEN
+        IF it.qtd_recontada IS NOT NULL THEN
+            RAISE EXCEPTION 'O item % já foi recontado. Decida entre ajustar ou ignorar.', it.cod_material;
+        END IF;
+        IF p_recontador IS NULL OR p_recontador = it.contado_por THEN
+            RAISE EXCEPTION 'Escolha outra pessoa para recontar (não quem fez a 1ª contagem).';
+        END IF;
+        UPDATE inventario_itens
+           SET status = 'RECONTAGEM', recontagem_responsavel = p_recontador, justificativa = p_justificativa
+         WHERE id = p_item_id;
+        UPDATE inventarios SET status = 'ABERTO' WHERE id = inv.id AND status = 'EM_REVISAO';
+        INSERT INTO inventario_eventos (inventario_id, item_id, evento, usuario, detalhe)
+        VALUES (inv.id, p_item_id, 'RECONTAGEM_PEDIDA', p_usuario,
+                format('%s → recontar por %s. %s', it.cod_material, p_recontador, COALESCE(p_justificativa, '')));
+        RETURN 'RECONTAGEM';
+
+    ELSIF p_acao = 'IGNORAR' THEN
+        IF length(trim(COALESCE(p_justificativa, ''))) < 5 THEN
+            RAISE EXCEPTION 'Informe a justificativa para ignorar a divergência (mínimo 5 caracteres).';
+        END IF;
+        UPDATE inventario_itens
+           SET status = 'IGNORADO', decidido_por = p_usuario, decidido_em = now(), justificativa = p_justificativa
+         WHERE id = p_item_id;
+        INSERT INTO inventario_eventos (inventario_id, item_id, evento, usuario, detalhe)
+        VALUES (inv.id, p_item_id, 'IGNORADO', p_usuario, format('%s: %s', it.cod_material, p_justificativa));
+        RETURN 'IGNORADO';
+
+    ELSIF p_acao = 'AJUSTAR' THEN
+        v_final := COALESCE(it.qtd_recontada, it.qtd_contada);
+        v_ref   := CASE WHEN it.qtd_recontada IS NOT NULL THEN it.saldo_recontagem ELSE it.saldo_contagem END;
+        v_delta := v_final - v_ref;
+
+        SELECT COALESCE(estoque, 0) INTO v_atual FROM estoque_cd
+         WHERE cod_material = it.cod_material AND cod_cd = inv.cod_cd FOR UPDATE;
+        v_atual := COALESCE(v_atual, 0);
+        v_novo := v_atual + v_delta;
+        IF v_novo < 0 THEN
+            RAISE EXCEPTION 'O ajuste deixaria o saldo negativo (atual %, ajuste %). Peça recontagem.', v_atual, v_delta;
+        END IF;
+
+        INSERT INTO estoque_cd (cod_material, cod_cd, estoque) VALUES (it.cod_material, inv.cod_cd, v_novo)
+        ON CONFLICT (cod_material, cod_cd) DO UPDATE SET estoque = EXCLUDED.estoque;
+
+        SELECT COALESCE(sum(estoque), 0) INTO v_total FROM estoque_cd WHERE cod_material = it.cod_material;
+        SELECT COALESCE(estoque_minimo, 0) INTO v_min FROM materiais WHERE codigo = it.cod_material;
+        UPDATE materiais
+           SET estoque = v_total,
+               indicador = CASE WHEN COALESCE(v_min, 0) > 0 THEN round(v_total / v_min, 2) ELSE 0 END
+         WHERE codigo = it.cod_material;
+
+        INSERT INTO log_alteracoes_estoque
+            (cod_material, descricao, tipo, quantidade, estoque_antes, estoque_depois, usuario, filial, observacao)
+        VALUES (it.cod_material, it.descricao, 'INVENTARIO', v_delta, v_atual, v_novo, p_usuario, inv.cod_cd,
+                format('[CD %s] Inventário #%s: contado %s, sistema na contagem %s%s',
+                       inv.cod_cd, inv.id, v_final, v_ref,
+                       CASE WHEN p_justificativa IS NOT NULL AND p_justificativa <> '' THEN ' | ' || p_justificativa ELSE '' END));
+
+        UPDATE inventario_itens
+           SET status = 'AJUSTADO', ajuste = v_delta, decidido_por = p_usuario, decidido_em = now(),
+               justificativa = p_justificativa
+         WHERE id = p_item_id;
+        INSERT INTO inventario_eventos (inventario_id, item_id, evento, usuario, detalhe)
+        VALUES (inv.id, p_item_id, 'AJUSTADO', p_usuario,
+                format('%s: saldo %s → %s (ajuste %s)', it.cod_material, v_atual, v_novo, v_delta));
+        RETURN 'AJUSTADO';
+    END IF;
+    RAISE EXCEPTION 'Ação inválida: %', p_acao;
+END;
+$$;
+
+
+--
+-- Name: inv_dentro_tolerancia(numeric, numeric, numeric, numeric); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.inv_dentro_tolerancia(p_contado numeric, p_saldo numeric, p_pct numeric, p_abs numeric) RETURNS boolean
+    LANGUAGE sql IMMUTABLE
+    AS $$
+    SELECT abs(p_contado - p_saldo) <= GREATEST(COALESCE(p_abs, 0), abs(p_saldo) * COALESCE(p_pct, 0) / 100.0);
+$$;
+
+
+--
+-- Name: inv_eventos_imutavel(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.inv_eventos_imutavel() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    RAISE EXCEPTION 'A trilha de auditoria do inventário não pode ser alterada nem apagada.';
+END;
+$$;
+
+
+--
+-- Name: inv_registrar_contagem(integer, numeric, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.inv_registrar_contagem(p_item_id integer, p_qtd numeric, p_usuario text) RETURNS text
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    it   inventario_itens%ROWTYPE;
+    inv  inventarios%ROWTYPE;
+    v_saldo NUMERIC;
+    v_status TEXT;
+BEGIN
+    IF p_qtd IS NULL OR p_qtd < 0 THEN
+        RAISE EXCEPTION 'Quantidade contada inválida.';
+    END IF;
+    SELECT * INTO it FROM inventario_itens WHERE id = p_item_id FOR UPDATE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Item de inventário não encontrado.'; END IF;
+    SELECT * INTO inv FROM inventarios WHERE id = it.inventario_id FOR UPDATE;
+    IF inv.status <> 'ABERTO' THEN
+        RAISE EXCEPTION 'O inventário #% não está aberto para contagem (status %).', inv.id, inv.status;
+    END IF;
+
+    SELECT COALESCE(estoque, 0) INTO v_saldo
+      FROM estoque_cd WHERE cod_material = it.cod_material AND cod_cd = inv.cod_cd;
+    v_saldo := COALESCE(v_saldo, 0);
+
+    IF it.status = 'PENDENTE' THEN
+        IF p_usuario IS DISTINCT FROM inv.responsavel THEN
+            RAISE EXCEPTION 'Este inventário está atribuído a %.', inv.responsavel;
+        END IF;
+        v_status := CASE WHEN inv_dentro_tolerancia(p_qtd, v_saldo, inv.tolerancia_pct, inv.tolerancia_abs)
+                         THEN 'OK' ELSE 'DIVERGENTE' END;
+        UPDATE inventario_itens
+           SET qtd_contada = p_qtd, saldo_contagem = v_saldo, contado_por = p_usuario,
+               contado_em = now(), status = v_status
+         WHERE id = p_item_id;
+        INSERT INTO inventario_eventos (inventario_id, item_id, evento, usuario, detalhe)
+        VALUES (inv.id, p_item_id, 'CONTAGEM', p_usuario,
+                format('%s: contado %s / sistema %s → %s', it.cod_material, p_qtd, v_saldo, v_status));
+    ELSIF it.status = 'RECONTAGEM' THEN
+        IF p_usuario IS DISTINCT FROM it.recontagem_responsavel THEN
+            RAISE EXCEPTION 'A recontagem deste item está atribuída a %.', it.recontagem_responsavel;
+        END IF;
+        IF p_usuario = it.contado_por THEN
+            RAISE EXCEPTION 'A recontagem precisa ser feita por outra pessoa.';
+        END IF;
+        v_status := CASE WHEN inv_dentro_tolerancia(p_qtd, v_saldo, inv.tolerancia_pct, inv.tolerancia_abs)
+                         THEN 'OK' ELSE 'DIVERGENTE' END;
+        UPDATE inventario_itens
+           SET qtd_recontada = p_qtd, saldo_recontagem = v_saldo, recontado_por = p_usuario,
+               recontado_em = now(), status = v_status
+         WHERE id = p_item_id;
+        INSERT INTO inventario_eventos (inventario_id, item_id, evento, usuario, detalhe)
+        VALUES (inv.id, p_item_id, 'RECONTAGEM', p_usuario,
+                format('%s: recontado %s / sistema %s → %s', it.cod_material, p_qtd, v_saldo, v_status));
+    ELSE
+        RAISE EXCEPTION 'O item % já foi contado (status %).', it.cod_material, it.status;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM inventario_itens
+                    WHERE inventario_id = inv.id AND status IN ('PENDENTE', 'RECONTAGEM')) THEN
+        UPDATE inventarios SET status = 'EM_REVISAO' WHERE id = inv.id;
+        INSERT INTO inventario_eventos (inventario_id, evento, usuario, detalhe)
+        VALUES (inv.id, 'ENVIADO_REVISAO', p_usuario, 'Todos os itens contados');
+    END IF;
+    RETURN v_status;
+END;
+$$;
+
+
+--
 -- Name: registrar_entrada_atomica(jsonb, text); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -1124,6 +1450,64 @@ $$;
 
 
 --
+-- Name: transferir_estoque_cd(text, text, text, numeric, text, text, text, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.transferir_estoque_cd(p_cod_material text, p_cod_cd_origem text, p_cod_cd_destino text, p_quantidade numeric, p_descricao text, p_data text, p_observacao text, p_registrado_por text) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    v_estoque_origem NUMERIC := 0;
+    v_estoque_minimo NUMERIC := 0;
+    v_total NUMERIC := 0;
+    v_indicador NUMERIC := 0;
+BEGIN
+    SELECT COALESCE(estoque, 0) INTO v_estoque_origem
+    FROM estoque_cd
+    WHERE cod_material = p_cod_material AND cod_cd = p_cod_cd_origem
+    FOR UPDATE;
+    v_estoque_origem := COALESCE(v_estoque_origem, 0);  -- sem linha no CD = saldo 0
+
+    IF v_estoque_origem < p_quantidade THEN
+        RAISE EXCEPTION 'Estoque insuficiente no CD %. Disponível: %, Solicitado: %',
+            p_cod_cd_origem, v_estoque_origem, p_quantidade;
+    END IF;
+
+    UPDATE estoque_cd
+    SET estoque = v_estoque_origem - p_quantidade
+    WHERE cod_material = p_cod_material AND cod_cd = p_cod_cd_origem;
+
+    INSERT INTO estoque_cd (cod_material, cod_cd, estoque)
+    VALUES (p_cod_material, p_cod_cd_destino, p_quantidade)
+    ON CONFLICT (cod_material, cod_cd)
+    DO UPDATE SET estoque = estoque_cd.estoque + p_quantidade;
+
+    INSERT INTO transferencias_cd (
+        data, cod_material, descricao, quantidade,
+        cd_origem, cd_destino, observacao, registrado_por
+    ) VALUES (
+        p_data, p_cod_material, p_descricao, p_quantidade,
+        p_cod_cd_origem, p_cod_cd_destino, p_observacao, p_registrado_por
+    );
+
+    SELECT COALESCE(SUM(estoque), 0) INTO v_total
+    FROM estoque_cd
+    WHERE cod_material = p_cod_material;
+
+    SELECT COALESCE(estoque_minimo, 0) INTO v_estoque_minimo
+    FROM materiais
+    WHERE codigo = p_cod_material;
+
+    v_indicador := CASE WHEN v_estoque_minimo > 0 THEN ROUND(v_total / v_estoque_minimo, 2) ELSE 0 END;
+
+    UPDATE materiais
+    SET estoque = v_total, indicador = v_indicador
+    WHERE codigo = p_cod_material;
+END;
+$$;
+
+
+--
 -- Name: apply_rls(jsonb, integer); Type: FUNCTION; Schema: realtime; Owner: -
 --
 
@@ -1170,6 +1554,14 @@ declare
     columns realtime.wal_column[];
     -- previous identity values for update/delete
     old_columns realtime.wal_column[];
+
+    -- the same values as wal2json sent them, which is what filters compare against
+    raw_columns realtime.wal_column[] =
+        array_agg((x->>'name', x->>'type', x->>'typeoid', x->'value', null, null)::realtime.wal_column)
+        from jsonb_array_elements(wal -> 'columns') x;
+    raw_old_columns realtime.wal_column[] =
+        array_agg((x->>'name', x->>'type', x->>'typeoid', x->'value', null, null)::realtime.wal_column)
+        from jsonb_array_elements(wal -> 'identity') x;
 
     error_record_exceeds_max_size boolean = octet_length(wal::text) > max_record_bytes;
 
@@ -1329,10 +1721,10 @@ begin
                         subs.entity = entity_
                         and subs.claims_role = working_role
                         and (
-                            realtime.is_visible_through_filters(columns, subs.filters)
+                            realtime.is_visible_through_filters(raw_columns, subs.filters)
                             or (
                               action = 'DELETE'
-                              and realtime.is_visible_through_filters(old_columns, subs.filters)
+                              and realtime.is_visible_through_filters(raw_old_columns, subs.filters)
                             )
                         )
             ) loop
@@ -1532,12 +1924,15 @@ begin
             set_config('request.jwt.claim.role', role_name, true),
             set_config('request.headers', headers, true);
 
-    -- One lookup for every probe, by the full primary key.
-    visible_ids := array(
-      select m.id
-      from realtime.messages m
-      where m.inserted_at = probe_inserted_at
-        and m.id = any(probe_ids));
+    -- One lookup for every probe, by the full primary key. Skipped without probes, so the
+    -- SELECT policies are not planned for a write.
+    if cardinality(probe_ids) > 0 then
+      visible_ids := array(
+        select m.id
+        from realtime.messages m
+        where m.inserted_at = probe_inserted_at
+          and m.id = any(probe_ids));
+    end if;
 
     read_allowed := array(
       select p.id = any(visible_ids)
@@ -1756,6 +2151,18 @@ begin
 
     return case when negate then not res else res end;
 end;
+$$;
+
+
+--
+-- Name: filters_hash(realtime.user_defined_filter[]); Type: FUNCTION; Schema: realtime; Owner: -
+--
+
+CREATE FUNCTION realtime.filters_hash(filters realtime.user_defined_filter[]) RETURNS bytea
+    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+    AS $$
+  select pg_catalog.int8send(pg_catalog.hash_array_extended(filters, 0))
+      || pg_catalog.int8send(pg_catalog.hash_array_extended(filters, 1))
 $$;
 
 
@@ -4657,6 +5064,7 @@ CREATE TABLE auth.one_time_tokens (
     created_at timestamp without time zone DEFAULT now() NOT NULL,
     updated_at timestamp without time zone DEFAULT now() NOT NULL,
     expires_at timestamp with time zone,
+    link_token_hash text,
     CONSTRAINT one_time_tokens_token_hash_check CHECK ((char_length(token_hash) > 0))
 );
 
@@ -4718,6 +5126,7 @@ CREATE TABLE auth.saml_providers (
     created_at timestamp with time zone,
     updated_at timestamp with time zone,
     name_id_format text,
+    dedicated_scope boolean,
     CONSTRAINT "entity_id not empty" CHECK ((char_length(entity_id) > 0)),
     CONSTRAINT "metadata_url not empty" CHECK (((metadata_url = NULL::text) OR (char_length(metadata_url) > 0))),
     CONSTRAINT "metadata_xml not empty" CHECK ((char_length(metadata_xml) > 0))
@@ -5026,6 +5435,19 @@ CREATE TABLE public.centros_distribuicao (
 
 
 --
+-- Name: configuracoes_sistema; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.configuracoes_sistema (
+    chave text NOT NULL,
+    valor text NOT NULL,
+    descricao text NOT NULL,
+    atualizado_por text,
+    atualizado_em timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
 -- Name: emprestimos_ferramenta; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -5041,6 +5463,42 @@ CREATE TABLE public.emprestimos_ferramenta (
     data_devolucao_real timestamp with time zone,
     registrado_por text,
     observacao text
+);
+
+
+--
+-- Name: enderecos; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.enderecos (
+    id bigint NOT NULL,
+    cod_cd text NOT NULL,
+    rua character(1) NOT NULL,
+    predio smallint NOT NULL,
+    nivel smallint NOT NULL,
+    apartamento smallint NOT NULL,
+    codigo text GENERATED ALWAYS AS ((((((((rua)::text || '.'::text) || lpad((predio)::text, 2, '0'::text)) || '.'::text) || lpad((nivel)::text, 2, '0'::text)) || '.'::text) || lpad((apartamento)::text, 2, '0'::text))) STORED,
+    ativo boolean DEFAULT true NOT NULL,
+    criado_por text,
+    criado_em timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT enderecos_apartamento_check CHECK (((apartamento >= 1) AND (apartamento <= 99))),
+    CONSTRAINT enderecos_nivel_check CHECK (((nivel >= 1) AND (nivel <= 99))),
+    CONSTRAINT enderecos_predio_check CHECK (((predio >= 1) AND (predio <= 99))),
+    CONSTRAINT enderecos_rua_check CHECK ((rua ~ '^[A-Z]$'::text))
+);
+
+
+--
+-- Name: enderecos_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.enderecos ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME public.enderecos_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
 );
 
 
@@ -5155,7 +5613,8 @@ CREATE TABLE public.historico_acessos (
     id integer NOT NULL,
     usuario text NOT NULL,
     data text NOT NULL,
-    hora text NOT NULL
+    hora text NOT NULL,
+    versao text
 );
 
 
@@ -5247,6 +5706,135 @@ CREATE SEQUENCE public.historico_status_separacao_id_seq
 --
 
 ALTER SEQUENCE public.historico_status_separacao_id_seq OWNED BY public.historico_status_separacao.id;
+
+
+--
+-- Name: inventario_eventos; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.inventario_eventos (
+    id bigint NOT NULL,
+    inventario_id integer NOT NULL,
+    item_id integer,
+    evento text NOT NULL,
+    usuario text NOT NULL,
+    detalhe text,
+    criado_em timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: inventario_eventos_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.inventario_eventos_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: inventario_eventos_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.inventario_eventos_id_seq OWNED BY public.inventario_eventos.id;
+
+
+--
+-- Name: inventario_itens; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.inventario_itens (
+    id integer NOT NULL,
+    inventario_id integer NOT NULL,
+    cod_material text NOT NULL,
+    descricao text,
+    enderecos text,
+    status text DEFAULT 'PENDENTE'::text NOT NULL,
+    qtd_contada numeric,
+    saldo_contagem numeric,
+    contado_por text,
+    contado_em timestamp with time zone,
+    recontagem_responsavel text,
+    qtd_recontada numeric,
+    saldo_recontagem numeric,
+    recontado_por text,
+    recontado_em timestamp with time zone,
+    ajuste numeric,
+    decidido_por text,
+    decidido_em timestamp with time zone,
+    justificativa text,
+    CONSTRAINT inventario_itens_status_check CHECK ((status = ANY (ARRAY['PENDENTE'::text, 'OK'::text, 'DIVERGENTE'::text, 'RECONTAGEM'::text, 'AJUSTADO'::text, 'IGNORADO'::text])))
+);
+
+
+--
+-- Name: inventario_itens_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.inventario_itens_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: inventario_itens_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.inventario_itens_id_seq OWNED BY public.inventario_itens.id;
+
+
+--
+-- Name: inventarios; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.inventarios (
+    id integer NOT NULL,
+    cod_cd text NOT NULL,
+    titulo text NOT NULL,
+    tipo text NOT NULL,
+    status text DEFAULT 'ABERTO'::text NOT NULL,
+    responsavel text NOT NULL,
+    criado_por text NOT NULL,
+    criado_em timestamp with time zone DEFAULT now() NOT NULL,
+    prazo date NOT NULL,
+    tolerancia_pct numeric DEFAULT 0 NOT NULL,
+    tolerancia_abs numeric DEFAULT 0 NOT NULL,
+    concluido_em timestamp with time zone,
+    concluido_por text,
+    acuracia numeric,
+    observacao text,
+    CONSTRAINT inventarios_status_check CHECK ((status = ANY (ARRAY['ABERTO'::text, 'EM_REVISAO'::text, 'CONCLUIDO'::text, 'CANCELADO'::text]))),
+    CONSTRAINT inventarios_tipo_check CHECK ((tipo = ANY (ARRAY['ENDERECO'::text, 'SELECIONADO'::text, 'ALEATORIO'::text]))),
+    CONSTRAINT inventarios_tolerancia_abs_check CHECK ((tolerancia_abs >= (0)::numeric)),
+    CONSTRAINT inventarios_tolerancia_pct_check CHECK ((tolerancia_pct >= (0)::numeric))
+);
+
+
+--
+-- Name: inventarios_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.inventarios_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: inventarios_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.inventarios_id_seq OWNED BY public.inventarios.id;
 
 
 --
@@ -5395,6 +5983,75 @@ ALTER SEQUENCE public.log_alteracoes_quantidade_sc_id_seq OWNED BY public.log_al
 
 
 --
+-- Name: log_estornos_entrada; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.log_estornos_entrada (
+    id bigint NOT NULL,
+    entrada_id integer NOT NULL,
+    dados_item jsonb NOT NULL,
+    estornado_em timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: log_estornos_entrada_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.log_estornos_entrada_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: log_estornos_entrada_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.log_estornos_entrada_id_seq OWNED BY public.log_estornos_entrada.id;
+
+
+--
+-- Name: log_exclusoes_item_sc; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.log_exclusoes_item_sc (
+    id integer NOT NULL,
+    sc_numero text NOT NULL,
+    sc_item integer NOT NULL,
+    cod_material text,
+    descricao_material text,
+    quantidade numeric(15,4),
+    status_no_momento text NOT NULL,
+    justificativa text NOT NULL,
+    excluido_por text NOT NULL,
+    data_exclusao timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: log_exclusoes_item_sc_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.log_exclusoes_item_sc_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: log_exclusoes_item_sc_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.log_exclusoes_item_sc_id_seq OWNED BY public.log_exclusoes_item_sc.id;
+
+
+--
 -- Name: materiais; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -5436,6 +6093,19 @@ CREATE VIEW public.materiais_abaixo_minimo AS
     indicador
    FROM public.materiais
   WHERE ((estoque < estoque_minimo) AND (estoque_minimo > (0)::double precision));
+
+
+--
+-- Name: material_endereco; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.material_endereco (
+    cod_material text NOT NULL,
+    cod_cd text NOT NULL,
+    endereco_id bigint NOT NULL,
+    criado_por text,
+    criado_em timestamp with time zone DEFAULT now() NOT NULL
+);
 
 
 --
@@ -5697,6 +6367,7 @@ CREATE TABLE public.solicitacoes_correcao_entrada (
     aprovado_por text,
     data_aprovacao timestamp with time zone,
     motivo_rejeicao text,
+    cod_fornecedor text,
     CONSTRAINT solicitacoes_correcao_entrada_status_check CHECK ((status = ANY (ARRAY['pendente'::text, 'aprovado'::text, 'rejeitado'::text]))),
     CONSTRAINT solicitacoes_correcao_entrada_tipo_check CHECK ((tipo = ANY (ARRAY['cancelamento'::text, 'ajuste_quantidade'::text])))
 );
@@ -5836,6 +6507,41 @@ CREATE TABLE public.unidades_medida (
 
 
 --
+-- Name: usuario_papeis; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.usuario_papeis (
+    id integer NOT NULL,
+    usuario_id integer NOT NULL,
+    papel text NOT NULL,
+    cod_cd text,
+    criado_por text,
+    criado_em timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT usuario_papeis_papel_check CHECK ((papel = ANY (ARRAY['ESTOQUISTA'::text, 'SUPERVISOR'::text, 'GERENTE'::text, 'ANALISTA DE PLANEJAMENTO'::text, 'COMPRADOR'::text, 'LIDER DE COMPRAS'::text])))
+);
+
+
+--
+-- Name: usuario_papeis_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.usuario_papeis_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: usuario_papeis_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.usuario_papeis_id_seq OWNED BY public.usuario_papeis.id;
+
+
+--
 -- Name: usuario_transacoes; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -5890,7 +6596,8 @@ CREATE TABLE realtime.messages (
     inserted_at timestamp without time zone DEFAULT timezone('utc'::text, clock_timestamp()) NOT NULL,
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     binary_payload bytea,
-    skip_broadcast boolean DEFAULT false NOT NULL
+    skip_broadcast boolean DEFAULT false NOT NULL,
+    expires_at timestamp without time zone
 )
 PARTITION BY RANGE (inserted_at);
 
@@ -6171,6 +6878,27 @@ ALTER TABLE ONLY public.historico_status_separacao ALTER COLUMN id SET DEFAULT n
 
 
 --
+-- Name: inventario_eventos id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.inventario_eventos ALTER COLUMN id SET DEFAULT nextval('public.inventario_eventos_id_seq'::regclass);
+
+
+--
+-- Name: inventario_itens id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.inventario_itens ALTER COLUMN id SET DEFAULT nextval('public.inventario_itens_id_seq'::regclass);
+
+
+--
+-- Name: inventarios id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.inventarios ALTER COLUMN id SET DEFAULT nextval('public.inventarios_id_seq'::regclass);
+
+
+--
 -- Name: log_alertas_compras id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -6192,6 +6920,20 @@ ALTER TABLE ONLY public.log_alteracoes_quantidade_sc ALTER COLUMN id SET DEFAULT
 
 
 --
+-- Name: log_estornos_entrada id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.log_estornos_entrada ALTER COLUMN id SET DEFAULT nextval('public.log_estornos_entrada_id_seq'::regclass);
+
+
+--
+-- Name: log_exclusoes_item_sc id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.log_exclusoes_item_sc ALTER COLUMN id SET DEFAULT nextval('public.log_exclusoes_item_sc_id_seq'::regclass);
+
+
+--
 -- Name: solicitacoes_correcao_entrada id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -6203,6 +6945,13 @@ ALTER TABLE ONLY public.solicitacoes_correcao_entrada ALTER COLUMN id SET DEFAUL
 --
 
 ALTER TABLE ONLY public.transferencias_cd ALTER COLUMN id SET DEFAULT nextval('public.transferencias_cd_id_seq'::regclass);
+
+
+--
+-- Name: usuario_papeis id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.usuario_papeis ALTER COLUMN id SET DEFAULT nextval('public.usuario_papeis_id_seq'::regclass);
 
 
 --
@@ -6525,6 +7274,14 @@ ALTER TABLE ONLY auth.webauthn_credentials
 
 
 --
+-- Name: categorias categorias_nome_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.categorias
+    ADD CONSTRAINT categorias_nome_unique UNIQUE (nome);
+
+
+--
 -- Name: categorias categorias_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -6541,11 +7298,27 @@ ALTER TABLE ONLY public.centros_distribuicao
 
 
 --
+-- Name: configuracoes_sistema configuracoes_sistema_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.configuracoes_sistema
+    ADD CONSTRAINT configuracoes_sistema_pkey PRIMARY KEY (chave);
+
+
+--
 -- Name: emprestimos_ferramenta emprestimos_ferramenta_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.emprestimos_ferramenta
     ADD CONSTRAINT emprestimos_ferramenta_pkey PRIMARY KEY (numero);
+
+
+--
+-- Name: enderecos enderecos_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.enderecos
+    ADD CONSTRAINT enderecos_pkey PRIMARY KEY (id);
 
 
 --
@@ -6613,6 +7386,38 @@ ALTER TABLE ONLY public.historico_status_separacao
 
 
 --
+-- Name: inventario_eventos inventario_eventos_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.inventario_eventos
+    ADD CONSTRAINT inventario_eventos_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: inventario_itens inventario_itens_inventario_id_cod_material_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.inventario_itens
+    ADD CONSTRAINT inventario_itens_inventario_id_cod_material_key UNIQUE (inventario_id, cod_material);
+
+
+--
+-- Name: inventario_itens inventario_itens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.inventario_itens
+    ADD CONSTRAINT inventario_itens_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: inventarios inventarios_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.inventarios
+    ADD CONSTRAINT inventarios_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: itens_solicitacao_separacao itens_solicitacao_separacao_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -6653,11 +7458,35 @@ ALTER TABLE ONLY public.log_alteracoes_quantidade_sc
 
 
 --
+-- Name: log_estornos_entrada log_estornos_entrada_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.log_estornos_entrada
+    ADD CONSTRAINT log_estornos_entrada_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: log_exclusoes_item_sc log_exclusoes_item_sc_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.log_exclusoes_item_sc
+    ADD CONSTRAINT log_exclusoes_item_sc_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: materiais materiais_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.materiais
     ADD CONSTRAINT materiais_pkey PRIMARY KEY (codigo);
+
+
+--
+-- Name: material_endereco material_endereco_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.material_endereco
+    ADD CONSTRAINT material_endereco_pkey PRIMARY KEY (cod_material, endereco_id);
 
 
 --
@@ -6746,6 +7575,30 @@ ALTER TABLE ONLY public.transferencias_cd
 
 ALTER TABLE ONLY public.unidades_medida
     ADD CONSTRAINT unidades_medida_pkey PRIMARY KEY (codigo);
+
+
+--
+-- Name: enderecos uq_enderecos_cd_id; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.enderecos
+    ADD CONSTRAINT uq_enderecos_cd_id UNIQUE (cod_cd, id);
+
+
+--
+-- Name: enderecos uq_enderecos_posicao; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.enderecos
+    ADD CONSTRAINT uq_enderecos_posicao UNIQUE (cod_cd, rua, predio, nivel, apartamento);
+
+
+--
+-- Name: usuario_papeis usuario_papeis_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.usuario_papeis
+    ADD CONSTRAINT usuario_papeis_pkey PRIMARY KEY (id);
 
 
 --
@@ -7065,6 +7918,13 @@ CREATE INDEX oauth_consents_active_user_client_idx ON auth.oauth_consents USING 
 --
 
 CREATE INDEX oauth_consents_user_order_idx ON auth.oauth_consents USING btree (user_id, granted_at DESC);
+
+
+--
+-- Name: one_time_tokens_link_token_hash_hash_idx; Type: INDEX; Schema: auth; Owner: -
+--
+
+CREATE INDEX one_time_tokens_link_token_hash_hash_idx ON auth.one_time_tokens USING hash (link_token_hash);
 
 
 --
@@ -7425,10 +8285,31 @@ CREATE INDEX idx_emprestimos_ferramenta_tecnico ON public.emprestimos_ferramenta
 
 
 --
+-- Name: idx_enderecos_cd_codigo; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_enderecos_cd_codigo ON public.enderecos USING btree (cod_cd, codigo);
+
+
+--
+-- Name: idx_entradas_cod_material; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_entradas_cod_material ON public.entradas USING btree (cod_material);
+
+
+--
 -- Name: idx_entradas_data; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_entradas_data ON public.entradas USING btree (data);
+
+
+--
+-- Name: idx_entradas_documento_fornecedor; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_entradas_documento_fornecedor ON public.entradas USING btree (numero_documento, cod_fornecedor);
 
 
 --
@@ -7464,6 +8345,13 @@ CREATE INDEX idx_estoque_cd_cd_mix ON public.estoque_cd USING btree (cod_cd, sta
 --
 
 CREATE INDEX idx_fornecedores_cnpj ON public.fornecedores USING btree (cnpj_cpf);
+
+
+--
+-- Name: idx_hist_sc_numero_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_hist_sc_numero_status ON public.historico_status_compra USING btree (numero, status_novo);
 
 
 --
@@ -7516,6 +8404,27 @@ CREATE INDEX idx_log_alertas_compras_usuario ON public.log_alertas_compras USING
 
 
 --
+-- Name: idx_log_estornos_entrada_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_log_estornos_entrada_id ON public.log_estornos_entrada USING btree (entrada_id);
+
+
+--
+-- Name: idx_log_exclusao_sc; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_log_exclusao_sc ON public.log_exclusoes_item_sc USING btree (sc_numero, sc_item);
+
+
+--
+-- Name: idx_log_exclusao_usuario; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_log_exclusao_usuario ON public.log_exclusoes_item_sc USING btree (excluido_por);
+
+
+--
 -- Name: idx_log_qtd_sc; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -7558,6 +8467,27 @@ CREATE INDEX idx_materiais_localizacao ON public.materiais USING btree (localiza
 
 
 --
+-- Name: idx_material_endereco_end; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_material_endereco_end ON public.material_endereco USING btree (endereco_id);
+
+
+--
+-- Name: idx_material_endereco_mat_cd; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_material_endereco_mat_cd ON public.material_endereco USING btree (cod_material, cod_cd);
+
+
+--
+-- Name: idx_saidas_cod_material; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_saidas_cod_material ON public.saidas USING btree (cod_material);
+
+
+--
 -- Name: idx_saidas_data; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -7576,6 +8506,27 @@ CREATE INDEX idx_saidas_numero ON public.saidas USING btree (numero);
 --
 
 CREATE INDEX idx_saidas_numero_chamado ON public.saidas USING btree (numero_chamado) WHERE (numero_chamado IS NOT NULL);
+
+
+--
+-- Name: idx_sc_cod_material; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_sc_cod_material ON public.solicitacoes_compra USING btree (cod_material);
+
+
+--
+-- Name: idx_sc_comprador_desig; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_sc_comprador_desig ON public.solicitacoes_compra USING btree (comprador_designado);
+
+
+--
+-- Name: idx_sc_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_sc_status ON public.solicitacoes_compra USING btree (status);
 
 
 --
@@ -7621,10 +8572,52 @@ CREATE INDEX idx_subconjuntos_categoria ON public.subconjuntos USING btree (cod_
 
 
 --
+-- Name: ix_inv_eventos; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_inv_eventos ON public.inventario_eventos USING btree (inventario_id, criado_em);
+
+
+--
+-- Name: ix_inv_itens_mat; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_inv_itens_mat ON public.inventario_itens USING btree (cod_material, contado_em);
+
+
+--
+-- Name: ix_inv_itens_recont; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_inv_itens_recont ON public.inventario_itens USING btree (recontagem_responsavel, status);
+
+
+--
+-- Name: ix_inventarios_cd; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_inventarios_cd ON public.inventarios USING btree (cod_cd, status);
+
+
+--
+-- Name: ix_inventarios_resp; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_inventarios_resp ON public.inventarios USING btree (responsavel, status);
+
+
+--
 -- Name: uq_subconjuntos_nome_categoria; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE UNIQUE INDEX uq_subconjuntos_nome_categoria ON public.subconjuntos USING btree (cod_categoria, upper(nome));
+
+
+--
+-- Name: ux_usuario_papeis; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_usuario_papeis ON public.usuario_papeis USING btree (usuario_id, papel, COALESCE(cod_cd, '*'::text));
 
 
 --
@@ -7635,17 +8628,17 @@ CREATE INDEX ix_realtime_subscription_entity ON realtime.subscription USING btre
 
 
 --
--- Name: messages_inserted_at_topic_index; Type: INDEX; Schema: realtime; Owner: -
+-- Name: messages_replay_index; Type: INDEX; Schema: realtime; Owner: -
 --
 
-CREATE INDEX messages_inserted_at_topic_index ON ONLY realtime.messages USING btree (inserted_at DESC, topic) WHERE ((extension = 'broadcast'::text) AND (private IS TRUE));
+CREATE INDEX messages_replay_index ON ONLY realtime.messages USING btree (topic, inserted_at DESC, COALESCE(expires_at, 'infinity'::timestamp without time zone)) WHERE ((extension = 'broadcast'::text) AND (private = true));
 
 
 --
--- Name: subscription_subscription_id_entity_filters_action_filter_selec; Type: INDEX; Schema: realtime; Owner: -
+-- Name: subscription_subscription_id_entity_filters_hash_key; Type: INDEX; Schema: realtime; Owner: -
 --
 
-CREATE UNIQUE INDEX subscription_subscription_id_entity_filters_action_filter_selec ON realtime.subscription USING btree (subscription_id, entity, filters, action_filter, COALESCE(selected_columns, '{}'::text[]));
+CREATE UNIQUE INDEX subscription_subscription_id_entity_filters_hash_key ON realtime.subscription USING btree (subscription_id, entity, realtime.filters_hash(filters), action_filter, COALESCE(selected_columns, '{}'::text[]));
 
 
 --
@@ -7674,6 +8667,13 @@ CREATE UNIQUE INDEX buckets_analytics_unique_name_idx ON storage.buckets_analyti
 --
 
 CREATE INDEX idx_multipart_uploads_list ON storage.s3_multipart_uploads USING btree (bucket_id, key, created_at);
+
+
+--
+-- Name: idx_multipart_uploads_parts_upload_part; Type: INDEX; Schema: storage; Owner: -
+--
+
+CREATE INDEX idx_multipart_uploads_parts_upload_part ON storage.s3_multipart_uploads_parts USING btree (upload_id, part_number);
 
 
 --
@@ -7751,6 +8751,13 @@ CREATE UNIQUE INDEX objects_bucket_id_name_version_key ON storage.objects USING 
 --
 
 CREATE UNIQUE INDEX vector_indexes_name_bucket_id_idx ON storage.vector_indexes USING btree (name, bucket_id);
+
+
+--
+-- Name: inventario_eventos tg_inv_eventos_imutavel; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER tg_inv_eventos_imutavel BEFORE DELETE OR UPDATE ON public.inventario_eventos FOR EACH ROW EXECUTE FUNCTION public.inv_eventos_imutavel();
 
 
 --
@@ -8045,6 +9052,30 @@ ALTER TABLE ONLY public.emprestimos_ferramenta
 
 
 --
+-- Name: enderecos enderecos_cod_cd_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.enderecos
+    ADD CONSTRAINT enderecos_cod_cd_fkey FOREIGN KEY (cod_cd) REFERENCES public.centros_distribuicao(codigo);
+
+
+--
+-- Name: material_endereco fk_material_endereco_cd; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.material_endereco
+    ADD CONSTRAINT fk_material_endereco_cd FOREIGN KEY (cod_cd, endereco_id) REFERENCES public.enderecos(cod_cd, id) ON DELETE RESTRICT;
+
+
+--
+-- Name: inventario_itens inventario_itens_inventario_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.inventario_itens
+    ADD CONSTRAINT inventario_itens_inventario_id_fkey FOREIGN KEY (inventario_id) REFERENCES public.inventarios(id) ON DELETE RESTRICT;
+
+
+--
 -- Name: itens_solicitacao_separacao itens_solicitacao_separacao_numero_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -8061,11 +9092,27 @@ ALTER TABLE ONLY public.materiais
 
 
 --
+-- Name: material_endereco material_endereco_cod_material_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.material_endereco
+    ADD CONSTRAINT material_endereco_cod_material_fkey FOREIGN KEY (cod_material) REFERENCES public.materiais(codigo) ON DELETE CASCADE;
+
+
+--
 -- Name: subconjuntos subconjuntos_cod_categoria_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.subconjuntos
     ADD CONSTRAINT subconjuntos_cod_categoria_fkey FOREIGN KEY (cod_categoria) REFERENCES public.categorias(codigo);
+
+
+--
+-- Name: usuario_papeis usuario_papeis_usuario_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.usuario_papeis
+    ADD CONSTRAINT usuario_papeis_usuario_id_fkey FOREIGN KEY (usuario_id) REFERENCES public.usuarios(id) ON DELETE CASCADE;
 
 
 --
@@ -8229,10 +9276,22 @@ ALTER TABLE auth.sso_providers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE auth.users ENABLE ROW LEVEL SECURITY;
 
 --
+-- Name: configuracoes_sistema; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.configuracoes_sistema ENABLE ROW LEVEL SECURITY;
+
+--
 -- Name: emprestimos_ferramenta; Type: ROW SECURITY; Schema: public; Owner: -
 --
 
 ALTER TABLE public.emprestimos_ferramenta ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: enderecos; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.enderecos ENABLE ROW LEVEL SECURITY;
 
 --
 -- Name: ferramentas; Type: ROW SECURITY; Schema: public; Owner: -
@@ -8247,6 +9306,24 @@ ALTER TABLE public.ferramentas ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.historico_status_separacao ENABLE ROW LEVEL SECURITY;
 
 --
+-- Name: inventario_eventos; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.inventario_eventos ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: inventario_itens; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.inventario_itens ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: inventarios; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.inventarios ENABLE ROW LEVEL SECURITY;
+
+--
 -- Name: itens_solicitacao_separacao; Type: ROW SECURITY; Schema: public; Owner: -
 --
 
@@ -8257,6 +9334,24 @@ ALTER TABLE public.itens_solicitacao_separacao ENABLE ROW LEVEL SECURITY;
 --
 
 ALTER TABLE public.log_alertas_compras ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: log_estornos_entrada; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.log_estornos_entrada ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: log_exclusoes_item_sc; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.log_exclusoes_item_sc ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: material_endereco; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.material_endereco ENABLE ROW LEVEL SECURITY;
 
 --
 -- Name: solicitacoes_separacao; Type: ROW SECURITY; Schema: public; Owner: -
@@ -8275,6 +9370,12 @@ ALTER TABLE public.subconjuntos ENABLE ROW LEVEL SECURITY;
 --
 
 ALTER TABLE public.tipos_ferramenta ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: usuario_papeis; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.usuario_papeis ENABLE ROW LEVEL SECURITY;
 
 --
 -- Name: messages; Type: ROW SECURITY; Schema: realtime; Owner: -
@@ -8405,5 +9506,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 6SitIhcJ5rai0qp3gekE5i36YjIdDFIiNM8funHZ7bVsI3W76C8qb28IDTYqnHZ
+\unrestrict 5qUG65a7dyShuLaTyBN8gGHoxPGycEaHSsLvSB5W9XZSaVL4bWNjNlBYVi2VVKe
 
