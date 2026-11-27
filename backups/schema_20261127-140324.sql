@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict t9gk1ELuyA37OU5Ze5elu7Ic3dpLJaUfpkcEHaWJ9cutZzyFebPMr88JpKPdPN8
+\restrict PviNFR9Vjt489TTs5w8iVbz4sNRWOv3lKhiTI3eiaXX33e8pXx2xnmJkzjoxUqV
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.12 (Ubuntu 17.12-1.pgdg26.04+1)
@@ -563,9 +563,18 @@ CREATE FUNCTION extensions.pgrst_ddl_watch() RETURNS event_trigger
     AS $$
 DECLARE
   cmd record;
+  obj_schema text;
 BEGIN
   FOR cmd IN SELECT * FROM pg_event_trigger_ddl_commands()
   LOOP
+    -- triggers and rules have no schema of their own (schema_name is NULL),
+    -- so use the schema of the table they belong to
+    obj_schema := CASE
+      WHEN cmd.object_type IN ('trigger', 'rule')
+        THEN (pg_identify_object_as_address(cmd.classid, cmd.objid, cmd.objsubid)).object_names[1]
+      ELSE cmd.schema_name
+    END;
+
     IF cmd.command_tag IN (
       'CREATE SCHEMA', 'ALTER SCHEMA'
     , 'CREATE TABLE', 'CREATE TABLE AS', 'SELECT INTO', 'ALTER TABLE'
@@ -579,7 +588,8 @@ BEGIN
     , 'COMMENT'
     )
     -- don't notify in case of CREATE TEMP table or other objects created on pg_temp
-    AND cmd.schema_name is distinct from 'pg_temp'
+    -- also exclude any objects inside Supabase schemas
+    AND COALESCE(obj_schema, '') NOT IN ('pg_temp', 'auth', 'realtime', '_realtime', 'storage')
     THEN
       NOTIFY pgrst, 'reload schema';
     END IF;
@@ -597,9 +607,17 @@ CREATE FUNCTION extensions.pgrst_drop_watch() RETURNS event_trigger
     AS $$
 DECLARE
   obj record;
+  obj_schema text;
 BEGIN
   FOR obj IN SELECT * FROM pg_event_trigger_dropped_objects()
   LOOP
+    -- triggers and rules have no schema of their own (schema_name is NULL),
+    -- so use the schema of the table they belonged to
+    obj_schema := CASE
+      WHEN obj.object_type IN ('trigger', 'rule') THEN obj.address_names[1]
+      ELSE obj.schema_name
+    END;
+
     IF obj.object_type IN (
       'schema'
     , 'table'
@@ -612,6 +630,8 @@ BEGIN
     , 'rule'
     )
     AND obj.is_temporary IS false -- no pg_temp objects
+    -- also exclude any objects inside Supabase schemas
+    AND COALESCE(obj_schema, '') NOT IN ('pg_temp', 'auth', 'realtime', '_realtime', 'storage')
     THEN
       NOTIFY pgrst, 'reload schema';
     END IF;
@@ -4747,6 +4767,8 @@ CREATE TABLE auth.custom_oauth_providers (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     custom_claims_allowlist text[] DEFAULT '{}'::text[] NOT NULL,
+    client_auth_method text DEFAULT 'client_secret'::text NOT NULL,
+    client_assertion_audience text,
     CONSTRAINT custom_oauth_providers_authorization_url_https CHECK (((authorization_url IS NULL) OR (authorization_url ~~ 'https://%'::text))),
     CONSTRAINT custom_oauth_providers_authorization_url_length CHECK (((authorization_url IS NULL) OR (char_length(authorization_url) <= 2048))),
     CONSTRAINT custom_oauth_providers_client_id_length CHECK (((char_length(client_id) >= 1) AND (char_length(client_id) <= 512))),
@@ -8670,6 +8692,13 @@ CREATE INDEX idx_multipart_uploads_list ON storage.s3_multipart_uploads USING bt
 
 
 --
+-- Name: idx_multipart_uploads_parts_upload_part; Type: INDEX; Schema: storage; Owner: -
+--
+
+CREATE INDEX idx_multipart_uploads_parts_upload_part ON storage.s3_multipart_uploads_parts USING btree (upload_id, part_number);
+
+
+--
 -- Name: idx_objects_bucket_id_name; Type: INDEX; Schema: storage; Owner: -
 --
 
@@ -9499,5 +9528,5 @@ CREATE EVENT TRIGGER pgrst_drop_watch ON sql_drop
 -- PostgreSQL database dump complete
 --
 
-\unrestrict t9gk1ELuyA37OU5Ze5elu7Ic3dpLJaUfpkcEHaWJ9cutZzyFebPMr88JpKPdPN8
+\unrestrict PviNFR9Vjt489TTs5w8iVbz4sNRWOv3lKhiTI3eiaXX33e8pXx2xnmJkzjoxUqV
 
